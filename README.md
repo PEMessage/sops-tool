@@ -38,8 +38,8 @@ expects.
 sops keys have no human name, so each distinct key gets a short **pronoun** of
 the form `<backend>~<index>`, and the pronouns are defined at the top of the
 output. The keys are shown like a diff against `.sops.yaml`: white means the key
-matches, a green `+` is a key the file has that the rule does not, and a red `-`
-is a key the rule expects that the file lacks:
+matches, a green `+` is a key `.sops.yaml` has but the file lacks, and a red `-`
+is a key the file has but `.sops.yaml` does not:
 
 ```console
 $ easy-sops status --branch
@@ -48,9 +48,9 @@ age~0: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 ## /repo
 encrypted        config/db.yaml            age~0
 encrypted        secrets/dev.yaml          age~0 age~1
-not encrypted    secrets/extra.yaml        -age~0 -age~1
-need updatekeys  app/extra-key.yaml        +age~0 age~1
-need rotate      secrets/missing-key.yaml  -age~0 age~1
+not encrypted    secrets/extra.yaml        +age~0 +age~1
+need updatekeys  secrets/missing-key.yaml  +age~0 age~1
+need rotate      app/extra-key.yaml        -age~0 age~1
 error            data/blob.bin             ?  <sops filestatus message>
 ```
 
@@ -58,9 +58,10 @@ The state words are named after the sops command that would fix the file:
 
 - **encrypted** (green) — no drift: the file's keys match the rule's;
 - **not encrypted** (white) — the rule covers the file, but it is plaintext;
-- **need updatekeys** (yellow) — pure `+` drift: the file carries a key the rule
-  does not list;
-- **need rotate** (yellow) — `-` drift: an expected key is missing;
+- **need updatekeys** (yellow) — `+` drift: the rule wants a key the file lacks
+  (`sops updatekeys` adds it);
+- **need rotate** (yellow) — `-` drift: the file carries a key the rule does not
+  list (`sops rotate`);
 - **error** (red) — `sops filestatus` could not classify the file; the message
   is appended to that file's own line, so it never disturbs the others.
 
@@ -72,8 +73,8 @@ paths:
 ```console
 $ easy-sops status -- secrets config
 encrypted        secrets/dev.yaml          age~0 age~1
-not encrypted    secrets/extra.yaml        -age~0 -age~1
-need rotate      secrets/missing-key.yaml  -age~0 age~1
+not encrypted    secrets/extra.yaml        +age~0 +age~1
+need updatekeys  secrets/missing-key.yaml  +age~0 age~1
 ```
 
 Machine-readable output mirrors `git status --porcelain`: one `<code>\t<path>`
@@ -84,8 +85,8 @@ line per file, with `E` (encrypted), `U` (not encrypted), `+` (need updatekeys),
 $ easy-sops status --porcelain
 !	data/blob.bin
 E	config/db.yaml
-+	app/extra-key.yaml
--	secrets/missing-key.yaml
++	secrets/missing-key.yaml
+-	app/extra-key.yaml
 U	secrets/extra.yaml
 ```
 

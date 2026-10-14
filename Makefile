@@ -77,13 +77,14 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 		> $(PLAYGROUND)/secrets/extra.yaml
 	printf '%s\n' \
 		'# matched by the secrets rule (which expects two keys) but encrypted' \
-		'# to one, so a minus-sign key is missing -> `status` says need rotate' \
+		'# to one, so a key the rule wants is missing -> plus-sign drift ->' \
+		'# `status` says need updatekeys' \
 		'scope: missing-key-demo' \
 		> $(PLAYGROUND)/secrets/missing-key.yaml
 	printf '%s\n' \
 		'# matched by the catch-all rule (which expects one key) but encrypted' \
-		'# to an extra key, so it is pure plus-sign drift -> `status` says' \
-		'# need updatekeys' \
+		'# to an extra key, so the file has a key the rule lacks -> minus-sign' \
+		'# drift -> `status` says need rotate' \
 		'scope: extra-key-demo' \
 		> $(PLAYGROUND)/app/extra-key.yaml
 	printf '%s\n' \
@@ -104,13 +105,13 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/secrets/prod.yaml
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/secrets/dev.yaml
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/config/db.yaml
-	# Missing an expected key -> minus-sign drift -> `need rotate`.
+	# The rule wants a key the file lacks -> plus-sign drift -> `need updatekeys`.
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient" --encrypt --in-place $(PLAYGROUND)/secrets/missing-key.yaml
-	# Encrypted to an extra key -> pure plus-sign drift -> `need updatekeys`.
+	# The file has a key the rule lacks -> minus-sign drift -> `need rotate`.
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient,$$recipient2" --encrypt --in-place $(PLAYGROUND)/app/extra-key.yaml
 
 	touch $(STAMP)
-	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need rotate:     secrets/missing-key.yaml (missing an expected key)' '  need updatekeys: app/extra-key.yaml (encrypted to an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:     notes.txt' '  filestatus !:    data/blob.bin' '' 'try: make demo'
+	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:     notes.txt' '  filestatus !:    data/blob.bin' '' 'try: make demo'
 
 playground: $(STAMP)
 

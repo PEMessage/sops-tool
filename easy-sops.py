@@ -44,7 +44,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -90,8 +90,8 @@ STATE_COLOR = {
 PORCELAIN_CODE = {
     STATE_ENCRYPTED: "E",
     STATE_PLAIN: "U",
-    STATE_UPDATEKEYS: "-",
-    STATE_ROTATE: "+",
+    STATE_UPDATEKEYS: "+",
+    STATE_ROTATE: "-",
     STATE_ERROR: "!",
 }
 LABEL_WIDTH = max(len(state) for state in STATE_COLOR)
@@ -562,11 +562,11 @@ def _status_entry(
         return StatusEntry(display, STATE_ENCRYPTED, set(), expected, set(), set(), True, None)
 
     extra, missing = actual - expected, expected - actual
-    if missing:
-        # A missing key shows as a red `-`: the file needs rotating.
+    if extra:
+        # The file carries a key the rule does not -> a red `-` -> rotate.
         state = STATE_ROTATE
-    elif extra:
-        # Only extra keys (all pure-green `+`): needs updatekeys.
+    elif missing:
+        # The rule wants a key the file lacks -> a green `+` -> updatekeys.
         state = STATE_UPDATEKEYS
     else:
         state = STATE_ENCRYPTED
@@ -582,10 +582,10 @@ def _key_tokens(entry: StatusEntry, pronouns: Mapping[Key, str]) -> list[tuple[s
         pronoun = pronouns[key]
         if key in entry.keys and key in entry.expected:
             tokens.append((pronoun, None))  # matches .sops.yaml -> white
-        elif key in entry.keys:
-            tokens.append((f"+{pronoun}", "green"))  # extra vs .sops.yaml
+        elif key in entry.expected:
+            tokens.append((f"+{pronoun}", "green"))  # .sops.yaml has it, file lacks it
         else:
-            tokens.append((f"-{pronoun}", "red"))  # missing vs .sops.yaml
+            tokens.append((f"-{pronoun}", "red"))  # file has it, .sops.yaml lacks it
     return tokens or [("-", None)]
 
 
