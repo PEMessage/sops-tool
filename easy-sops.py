@@ -9,23 +9,24 @@ Every command runs against a *repository*: the nearest `.sops.yaml` found by
 walking up from the current directory. `-C DIR` starts the search (and resolves
 relative path arguments) in `DIR`, just like `git -C`.
 
-The `.sops.yaml` is loaded once into an in-memory `Config` object; all commands
-are thin, asynchronous queries over it. Blocking work (filesystem walks, YAML
-parsing) is pushed onto threads, while `sops` itself is driven as a real async
-subprocess, so commands can fan out when they need to. Commands follow git's
-porcelain/plumbing split:
+The `.sops.yaml` is loaded once into an in-memory `Config` object. Commands are
+self-contained `Subcommand` classes: each defines its own arguments and its own
+`run`, and registers itself with the `@subcommand` decorator. Blocking work
+(directory walks, YAML parsing) runs on threads, while `sops` is driven as a
+real async subprocess.
 
 plumbing
   root       print the repository root
   ls-rules   list creation rules
   ls-files   list files caught by a rule
-  match      print the rule for a path
+  match      print the rule for a path (exit 1 if none)
 
 porcelain
   status     report whether matched files are encrypted
 
-`status --porcelain` prints one `<code>\\t<path>` line per file, where the code
-is `E` (encrypted), `U` (unencrypted) or `!` (error).
+Commands accept `--` before paths, like git: `easy-sops status -- secrets/`.
+Paths are printed relative to the current directory by default; pass
+`--full-name` for repository-root-relative paths.
 """
 
 from __future__ import annotations
@@ -39,11 +40,11 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -57,6 +58,16 @@ BACKENDS = (
     "azure_keyvault",
     "hc_vault_transit_uri",
 )
+
+# status -> (label, ansi color, porcelain code)
+STATUS_STYLE = {
+    "encrypted": ("encrypted", "green", "E"),
+    "plain": ("not encrypted", "yellow", "U"),
+    "error": ("error", "red", "!"),
+}
+LABEL_WIDTH = max(len(label) for label, _color, _code in STATUS_STYLE.values())
+
+ANSI = {"reset": "\033[0m", "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m"}
 
 
 class ConfigError(Exception):
@@ -130,8 +141,8 @@ class Config:
     def rule_for(self, path: Path) -> Rule | None:
         return self.match(self.relative(Path(path).resolve()))
 
-    async def files(self, roots: Sequence[Path] = ()) -> AsyncIterator[tuple[str, Path, Rule]]:
-        """Yield `(relpath, path, rule)` for every file caught by a rule."""
+    async def files(self, roots: Sequence[Path] = ()) -> AsyncIterator[tuple[Path, Rule]]:
+        """Yield `(path, rule)` for every file caught by a rule."""
         matched = await asyncio.to_thread(_matched_files, self, tuple(roots))
         for item in matched:
             yield item
@@ -175,16 +186,15 @@ def _parse_rules(config: Path, raw: Any) -> list[Rule]:
     return rules
 
 
-def _matched_files(config: Config, roots: Sequence[Path]) -> list[tuple[str, Path, Rule]]:
-    result: list[tuple[str, Path, Rule]] = []
+def _matched_files(config: Config, roots: Sequence[Path]) -> list[tuple[Path, Rule]]:
+    result: list[tuple[Path, Rule]] = []
     for root in roots or (config.root,):
         for path in _walk(Path(root)):
             if path.name == CONFIG_NAME:
                 continue
-            relpath = config.relative(path)
-            rule = config.match(relpath)
+            rule = config.rule_for(path)
             if rule is not None:
-                result.append((relpath, path, rule))
+                result.append((path, rule))
     return result
 
 
@@ -228,106 +238,197 @@ def _clean_error(stderr: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# path helpers
+# --------------------------------------------------------------------------- #
+def _base(args: argparse.Namespace) -> Path:
+    """Directory that relative paths are interpreted and displayed against."""
+    return Path(args.directory).expanduser().resolve() if args.directory else Path.cwd()
+
+
+def _resolve(raw: str, args: argparse.Namespace) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_absolute() and args.directory:
+        path = Path(args.directory) / path
+    return path.resolve()
+
+
+def _display(config: Config, path: Path, args: argparse.Namespace) -> str:
+    base = config.root if getattr(args, "full_name", False) else _base(args)
+    return Path(os.path.relpath(path, base)).as_posix()
+
+
+def _paint(text: str, color: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"{ANSI[color]}{text}{ANSI['reset']}"
+
+
+# --------------------------------------------------------------------------- #
+# subcommand framework
+# --------------------------------------------------------------------------- #
+class Subcommand:
+    """A self-contained command: it defines its own arguments and behaviour."""
+
+    name: str
+    help: str
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        """Register this command as the parser's dispatch target."""
+        parser.set_defaults(command=self)
+
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        raise NotImplementedError
+
+
+REGISTRY: dict[str, Subcommand] = {}
+
+
+def subcommand(cls: type[Subcommand]) -> type[Subcommand]:
+    """Register a `Subcommand` subclass under its `name`."""
+    REGISTRY[cls.name] = cls()
+    return cls
+
+
+def path_argument(parser: argparse.ArgumentParser, help: str) -> None:
+    """Add the common trailing PATH argument (usable after `--`, like git)."""
+    parser.add_argument("paths", nargs="*", metavar="PATH", help=help)
+
+
+# --------------------------------------------------------------------------- #
 # plumbing commands
 # --------------------------------------------------------------------------- #
-async def cmd_root(config: Config, args: argparse.Namespace) -> int:
-    print(config.root)
-    return 0
+@subcommand
+class RootCommand(Subcommand):
+    name = "root"
+    help = "print the repository root"
+
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        print(config.root)
+        return 0
 
 
-async def cmd_ls_rules(config: Config, args: argparse.Namespace) -> int:
-    for rule in config.rules:
-        pattern = rule.path_regex or "*"
-        backends = ",".join(rule.backends()) or "-"
-        print(f"{rule.name}\t{pattern}\t{backends}")
-    return 0
+@subcommand
+class LsRulesCommand(Subcommand):
+    name = "ls-rules"
+    help = "list creation rules (name, path_regex, backends)"
+
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        for rule in config.rules:
+            pattern = rule.path_regex or "*"
+            backends = ",".join(rule.backends()) or "-"
+            print(f"{rule.name}\t{pattern}\t{backends}")
+        return 0
 
 
-async def cmd_ls_files(config: Config, args: argparse.Namespace) -> int:
-    roots = [_resolve(path, args.directory) for path in args.paths]
-    async for relpath, _path, _rule in config.files(roots):
-        print(relpath)
-    return 0
+@subcommand
+class LsFilesCommand(Subcommand):
+    name = "ls-files"
+    help = "list files caught by a creation rule"
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        super().configure(parser)
+        path_argument(parser, "limit the listing to these paths")
+        parser.add_argument(
+            "--full-name",
+            action="store_true",
+            help="show paths relative to the repository root",
+        )
+
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        roots = [_resolve(path, args) for path in args.paths]
+        async for path, _rule in config.files(roots):
+            print(_display(config, path, args))
+        return 0
 
 
-async def cmd_match(config: Config, args: argparse.Namespace) -> int:
-    rule = config.rule_for(_resolve(args.path, args.directory))
-    if rule is None:
-        return 1
-    print(rule.name)
-    return 0
+@subcommand
+class MatchCommand(Subcommand):
+    name = "match"
+    help = "print the rule for a path (exit 1 if none)"
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        super().configure(parser)
+        parser.add_argument("path", metavar="PATH", help="path to look up")
+
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        rule = config.rule_for(_resolve(args.path, args))
+        if rule is None:
+            return 1
+        print(rule.name)
+        return 0
 
 
 # --------------------------------------------------------------------------- #
 # porcelain commands
 # --------------------------------------------------------------------------- #
-async def cmd_status(config: Config, args: argparse.Namespace) -> int:
-    sops = shutil.which("sops")
-    if sops is None:
-        print("easy-sops: sops not found in PATH", file=sys.stderr)
-        return 127
+@subcommand
+class StatusCommand(Subcommand):
+    name = "status"
+    help = "report whether matched files are encrypted"
 
-    roots = [_resolve(path, args.directory) for path in args.paths]
-    matches = [(relpath, path) async for relpath, path, _rule in config.files(roots)]
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        super().configure(parser)
+        path_argument(parser, "limit the report to these paths")
+        parser.add_argument("--branch", "-b", action="store_true", help="show the repository header")
+        parser.add_argument(
+            "--porcelain",
+            action="store_true",
+            help="machine-readable output: '<E|U|!>\\t<path>'",
+        )
+        parser.add_argument(
+            "--full-name",
+            action="store_true",
+            help="show paths relative to the repository root",
+        )
 
-    limit = asyncio.Semaphore(MAX_CONCURRENCY)
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        sops = shutil.which("sops")
+        if sops is None:
+            print("easy-sops: sops not found in PATH", file=sys.stderr)
+            return 127
 
-    async def check(relpath: str, path: Path) -> tuple[str, bool | None, str | None]:
-        async with limit:
-            encrypted, error = await filestatus(path, sops)
-        return relpath, encrypted, error
+        roots = [_resolve(path, args) for path in args.paths]
+        matches = [entry async for entry in config.files(roots)]
 
-    entries = await asyncio.gather(*(check(relpath, path) for relpath, path in matches))
+        limit = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    if args.porcelain:
-        for relpath, encrypted, error in entries:
-            code = "!" if error else ("E" if encrypted else "U")
-            print(f"{code}\t{relpath}")
+        async def check(path: Path) -> tuple[bool | None, str | None]:
+            async with limit:
+                return await filestatus(path, sops)
+
+        results = await asyncio.gather(*(check(path) for path, _rule in matches))
+
+        entries: list[tuple[str, str, str | None]] = []
+        for (path, _rule), (encrypted, error) in zip(matches, results):
+            if error is not None:
+                state = "error"
+            elif encrypted:
+                state = "encrypted"
+            else:
+                state = "plain"
+            entries.append((_display(config, path, args), state, error))
+
+        if args.porcelain:
+            for path, state, _error in entries:
+                print(f"{STATUS_STYLE[state][2]}\t{path}")
+            return 0
+
+        color = sys.stdout.isatty()
+        if args.branch:
+            print(f"## {config.root}")
+        for path, state, _error in entries:
+            label, shade, _code = STATUS_STYLE[state]
+            print(f"{_paint(label.ljust(LABEL_WIDTH), shade, color)}  {path}")
+
+        for path, _state, error in entries:
+            if error is not None:
+                print(f"{path}: {error}", file=sys.stderr)
         return 0
-
-    _report([(relpath, encrypted, error) for relpath, encrypted, error in entries])
-    return 0
-
-
-def _report(entries: Sequence[tuple[str, bool | None, str | None]]) -> None:
-    sections = {
-        "Encrypted": [path for path, enc, err in entries if err is None and enc],
-        "Not encrypted": [path for path, enc, err in entries if err is None and not enc],
-        "Errors": [f"{path}: {err}" for path, _enc, err in entries if err],
-    }
-    first = True
-    for title, items in sections.items():
-        if not items:
-            continue
-        if not first:
-            print()
-        first = False
-        print(f"{title}:")
-        for item in items:
-            print(f"  {item}")
 
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-Command = Callable[[Config, argparse.Namespace], Awaitable[int]]
-
-COMMANDS: dict[str, Command] = {
-    "root": cmd_root,
-    "ls-rules": cmd_ls_rules,
-    "ls-files": cmd_ls_files,
-    "match": cmd_match,
-    "status": cmd_status,
-}
-
-
-def _resolve(raw: str, base: str | None) -> Path:
-    path = Path(raw).expanduser()
-    if not path.is_absolute() and base:
-        path = Path(base) / path
-    return path.resolve()
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="easy-sops",
@@ -342,23 +443,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("root", help="print the repository root")
-    sub.add_parser("ls-rules", help="list creation rules (name, path_regex, backends)")
-
-    ls_files = sub.add_parser("ls-files", help="list files caught by a creation rule")
-    ls_files.add_argument("paths", nargs="*", metavar="PATH")
-
-    match = sub.add_parser("match", help="print the rule for PATH (exit 1 if none)")
-    match.add_argument("path", metavar="PATH")
-
-    status = sub.add_parser("status", help="report whether matched files are encrypted")
-    status.add_argument("paths", nargs="*", metavar="PATH")
-    status.add_argument(
-        "--porcelain",
-        action="store_true",
-        help="machine-readable output: '<E|U|!>\\t<path>'",
-    )
+    subparsers = parser.add_subparsers(required=True)
+    for command in REGISTRY.values():
+        subparser = subparsers.add_parser(command.name, help=command.help)
+        command.configure(subparser)
     return parser
 
 
@@ -368,7 +456,7 @@ async def run(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"easy-sops: {exc}", file=sys.stderr)
         return 2
-    return await COMMANDS[args.command](config, args)
+    return await args.command.run(config, args)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

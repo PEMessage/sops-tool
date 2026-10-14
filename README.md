@@ -10,10 +10,13 @@ Every command runs against a **repository**: the nearest `.sops.yaml` found by
 walking up from the current directory. `-C DIR` starts that search — and
 resolves relative path arguments — in `DIR`, exactly like `git -C`.
 
-The config is loaded once into an in-memory `Config` object; commands are thin,
-`async` queries over it. Blocking work (directory walks, YAML parsing) runs on
-threads via `asyncio.to_thread`, and `sops` is driven as a real async subprocess
-— so `status` fans its `sops filestatus` calls out concurrently.
+The config is loaded once into an in-memory `Config` object. Each command is a
+self-contained `Subcommand` class: it defines its own arguments and its own
+`run`, and registers itself with the `@subcommand` decorator — there is no
+central command table and no single place that knows every flag. Blocking work
+(directory walks, YAML parsing) runs on threads via `asyncio.to_thread`, and
+`sops` is driven as a real async subprocess, so `status` fans its
+`sops filestatus` calls out concurrently.
 
 Commands follow git's porcelain/plumbing split:
 
@@ -27,14 +30,27 @@ Commands follow git's porcelain/plumbing split:
 
 ## Usage
 
-```console
-$ easy-sops status
-Encrypted:
-  plain.yaml
+`status` mirrors `git status --short [--branch]`: one line per matched file,
+with a coloured status word, and paths relative to the current directory. Add
+`--branch` for a `##` header.
 
-Not encrypted:
-  secrets/dev.yaml
-  secrets/prod.yaml
+```console
+$ easy-sops status --branch
+## /repo
+encrypted      secrets/prod.yaml
+not encrypted  secrets/extra.yaml
+error          data/blob.bin
+```
+
+Paths are printed relative to the current directory by default; pass
+`--full-name` for repository-root-relative paths. Like git, a `--` separates
+options from paths, which limits the report to those paths:
+
+```console
+$ easy-sops status -- secrets config
+encrypted      secrets/prod.yaml
+not encrypted  secrets/extra.yaml
+encrypted      config/db.yaml
 ```
 
 Machine-readable output mirrors `git status --porcelain`: one `<code>\t<path>`
@@ -42,10 +58,9 @@ line per file, with `E` (encrypted), `U` (unencrypted) or `!` (error):
 
 ```console
 $ easy-sops status --porcelain
-!	bin.dat
-E	plain.yaml
-U	secrets/dev.yaml
-U	secrets/prod.yaml
+!	data/blob.bin
+E	secrets/prod.yaml
+U	secrets/extra.yaml
 ```
 
 Plumbing is stable and script-friendly:
