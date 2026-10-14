@@ -134,9 +134,10 @@ encrypted      secrets/extra.yaml
 ```
 
 `decrypt` is the mirror image: it decrypts, in place, every matched file that is
-encrypted. It only reports files it can actually decrypt with the available
-keys, and names the key(s) used; anything it cannot open is skipped. It takes
-the same `--` path filter and `-n/--dry-run` / `-i/--interactive` flags.
+encrypted. Each file is reported either as `decrypted` / `would decrypt` with
+the key(s) that opened it, or as `key no match` with the key(s) it needs (shown
+`-key`, like `status`). It takes the same `--` path filter and `-n/--dry-run` /
+`-i/--interactive` flags.
 
 sops itself accepts the age private key only through the `SOPS_AGE_KEY*`
 environment variables or a key service — there is no CLI flag for it (`--age`
@@ -158,6 +159,15 @@ $ sops-tool decrypt --age-key-file keys/age.txt --age-key-file keys/age2.txt -- 
 decrypted      secrets/dev.yaml          admin backup
 decrypted      secrets/missing-key.yaml  admin
 decrypted      secrets/prod.yaml         admin
+```
+
+A file none of the given keys can open is still reported, with the keys it
+needs:
+
+```console
+$ sops-tool decrypt --dry-run
+key no match   config/db.yaml      -age1azjar2evsuakyv9cjg66vhzvy3uwkw7uvu54fm9ewp9e4petdpkqzzpqrh
+key no match   secrets/prod.yaml   -admin
 ```
 
 Without `--age-key-file`, the environment is inherited, so `SOPS_AGE_KEY_FILE`

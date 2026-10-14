@@ -47,7 +47,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -416,6 +416,13 @@ def _key_labels(config: "Config", actual: set[Key] | None, available: set[str]) 
     return sorted(labels)
 
 
+def _no_match_tokens(config: "Config", actual: set[Key] | None) -> list[tuple[str, str | None]]:
+    """`-key` tokens for the keys a file needs, when none of them is available."""
+    if not actual:
+        return []
+    return [(f"-{config.key_names.get(key, key[1])}", "red") for key in sorted(actual)]
+
+
 async def _sops_decrypts(
     config: "Config", sops: str, path: Path, env: Mapping[str, str] | None = None
 ) -> bool:
@@ -546,6 +553,10 @@ def _paint(text: str, color: str | None, enabled: bool) -> str:
     if not enabled or color is None:
         return text
     return f"{ANSI[color]}{text}{ANSI['reset']}"
+
+
+def _paint_tokens(tokens: Sequence[tuple[str, str | None]], enabled: bool) -> str:
+    return " ".join(_paint(text, shade, enabled) if shade else text for text, shade in tokens)
 
 
 # --------------------------------------------------------------------------- #
@@ -812,8 +823,8 @@ ENCRYPT_COLOR = {
 DECRYPT_COLOR = {
     "decrypted": "green",
     "would decrypt": "yellow",
+    "key no match": "red",
     "skipped": None,
-    "error": "red",
 }
 
 
@@ -921,7 +932,7 @@ class DecryptCommand(Subcommand):
 
         color = sys.stdout.isatty()
         width = max(len(state) for state in DECRYPT_COLOR)
-        acted = 0
+        shown = 0
 
         key_files = [_resolve(name, args) for name in args.age_key_file]
         for key_file in key_files:
@@ -939,27 +950,31 @@ class DecryptCommand(Subcommand):
 
                 # Read the keys before decrypting: afterwards the sops block is gone.
                 actual = await asyncio.to_thread(_actual_keys, path)
-                labels = " ".join(_key_labels(config, actual, available)) or None
 
                 if args.dry_run:
-                    if await _sops_decrypts(config, sops, path, env):
-                        _emit_state(color, width, DECRYPT_COLOR, "would decrypt", display, labels)
-                        acted += 1
-                    continue
+                    decrypted = await _sops_decrypts(config, sops, path, env)
+                else:
+                    if args.interactive and not await _confirm("decrypt", display):
+                        _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
+                        shown += 1
+                        continue
+                    decrypted = await _sops_in_place(config, sops, "decrypt", path, env) is None
 
-                if args.interactive and not await _confirm("decrypt", display):
-                    _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
-                    continue
+                if decrypted:
+                    state = "would decrypt" if args.dry_run else "decrypted"
+                    tokens = [(label, None) for label in _key_labels(config, actual, available)]
+                else:
+                    # No key of ours opens it: like `status`, show the keys it needs.
+                    state = "key no match"
+                    tokens = _no_match_tokens(config, actual)
 
-                # Only report files we could actually decrypt with these keys.
-                if await _sops_in_place(config, sops, "decrypt", path, env) is None:
-                    _emit_state(color, width, DECRYPT_COLOR, "decrypted", display, labels)
-                    acted += 1
+                _emit_state(color, width, DECRYPT_COLOR, state, display, _paint_tokens(tokens, color))
+                shown += 1
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
-        if acted == 0:
+        if shown == 0:
             print("nothing to decrypt")
         return 0
 
