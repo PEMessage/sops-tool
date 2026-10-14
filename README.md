@@ -27,6 +27,7 @@ Commands follow git's porcelain/plumbing split:
 | plumbing  | `ls-files` | list files caught by a rule                        |
 | plumbing  | `match`    | print the rule for a path (exit 1 if none)         |
 | porcelain | `status`   | report whether matched files are encrypted         |
+| porcelain | `encrypt`  | encrypt matched files that are not encrypted yet    |
 
 ## Usage
 
@@ -103,11 +104,32 @@ line per file, with `E` (encrypted), `U` (not encrypted), `+` (need updatekeys),
 
 ```console
 $ easy-sops status --porcelain
-!	data/blob.bin
+!	data/broken.yaml
 E	config/db.yaml
-+	secrets/missing-key.yaml
+U	data/blob.bin
 -	app/extra-key.yaml
-U	secrets/extra.yaml
++	secrets/missing-key.yaml
+```
+
+`encrypt` is the write-side counterpart: it encrypts, in place, every matched
+file that is not encrypted yet, leaving already-encrypted files alone. It takes
+the same `--` path filter, and `-n/--dry-run` prints what it would do without
+touching anything:
+
+```console
+$ easy-sops encrypt --dry-run -- secrets
+would encrypt  secrets/extra.yaml
+
+$ easy-sops encrypt -- secrets
+encrypted      secrets/extra.yaml
+```
+
+Use `-i/--interactive` to confirm each file one at a time:
+
+```console
+$ easy-sops encrypt -i
+encrypt secrets/extra.yaml? [y/N] y
+encrypted      secrets/extra.yaml
 ```
 
 Plumbing is stable and script-friendly:

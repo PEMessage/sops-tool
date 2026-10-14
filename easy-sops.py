@@ -23,6 +23,7 @@ plumbing
 
 porcelain
   status     report whether matched files are encrypted
+  encrypt    encrypt matched, not-yet-encrypted files in place
 
 Commands accept `--` before paths, like git: `easy-sops status -- secrets/`.
 Paths are printed relative to the current directory by default; pass
@@ -44,7 +45,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -337,6 +338,24 @@ def _is_read_error(message: str) -> bool:
     return "error reading file" in lowered or "permission denied" in lowered
 
 
+async def _encrypt(config: "Config", sops: str, path: Path) -> str | None:
+    """Encrypt one file in place with the repository config. Returns an error."""
+    proc = await asyncio.create_subprocess_exec(
+        sops,
+        "--config",
+        str(config.path),
+        "--encrypt",
+        "--in-place",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return _clean_error(stderr.decode(errors="replace"))
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # master keys
 # --------------------------------------------------------------------------- #
@@ -375,14 +394,23 @@ def _keys_from_fields(fields: Mapping[str, Any]) -> set[Key]:
 def _actual_keys(path: Path) -> set[Key] | None:
     """Master keys a file is actually encrypted to, from its plaintext metadata.
 
-    Returns ``None`` when the format cannot be introspected (e.g. binary).
+    The format is detected from the content, not the extension, so a sops file
+    stored as JSON under an arbitrary name still resolves. Returns ``None`` when
+    the file cannot be introspected (e.g. the binary store).
     """
-    if path.suffix.lower() not in {".yaml", ".yml", ".json"}:
-        return None
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
+    # The file may be JSON (sops' fallback for unknown extensions, and it uses
+    # tab indentation, which YAML rejects), or YAML. Try JSON first.
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return None
     if not isinstance(data, Mapping):
         return None
     block = data.get("sops")
@@ -692,6 +720,83 @@ def _print_status(
         if entry.error is not None:
             line += f"  {entry.error}"
         print(line)
+
+
+# --------------------------------------------------------------------------- #
+# porcelain: encrypt
+# --------------------------------------------------------------------------- #
+ENCRYPT_COLOR = {
+    "encrypted": "green",
+    "would encrypt": "yellow",
+    "skipped": None,
+    "error": "red",
+}
+
+
+def _emit_state(color: bool, width: int, state: str, path: str, detail: str | None = None) -> None:
+    label = _paint(state.ljust(width), ENCRYPT_COLOR.get(state), color)
+    print(f"{label}  {path}" + (f"  {detail}" if detail else ""))
+
+
+async def _confirm(display: str) -> bool:
+    answer = await asyncio.to_thread(input, f"encrypt {display}? [y/N] ")
+    return answer.strip().lower() in {"y", "yes"}
+
+
+@subcommand
+class EncryptCommand(Subcommand):
+    name = "encrypt"
+    help = "encrypt, in place, every matched file that is not encrypted yet"
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        super().configure(parser)
+        path_argument(parser, "limit to these paths")
+        parser.add_argument("-n", "--dry-run", action="store_true", help="only show what would be encrypted")
+        parser.add_argument("-i", "--interactive", action="store_true", help="confirm each file before encrypting")
+        parser.add_argument("--full-name", action="store_true", help="show paths relative to the repository root")
+
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        sops = shutil.which("sops")
+        if sops is None:
+            print("easy-sops: sops not found in PATH", file=sys.stderr)
+            return 127
+
+        roots = [_resolve(path, args) for path in args.paths]
+        matches = [entry async for entry in config.files(roots)]
+
+        color = sys.stdout.isatty()
+        width = max(len(state) for state in ENCRYPT_COLOR)
+        acted = errors = 0
+
+        for path, _rule in matches:
+            display = _display(config, path, args)
+            encrypted, error = await filestatus(path, sops)
+
+            if error is not None and _is_read_error(error):
+                _emit_state(color, width, "error", display, error)
+                errors += 1
+                continue
+            if encrypted:
+                continue  # already a sops document
+            if args.dry_run:
+                _emit_state(color, width, "would encrypt", display)
+                acted += 1
+                continue
+            if args.interactive and not await _confirm(display):
+                _emit_state(color, width, "skipped", display)
+                continue
+
+            failure = await _encrypt(config, sops, path)
+            if failure is None:
+                _emit_state(color, width, "encrypted", display)
+                acted += 1
+            else:
+                _emit_state(color, width, "error", display, failure)
+                errors += 1
+
+        if acted == 0 and errors == 0:
+            print("nothing to encrypt")
+        return 1 if errors else 0
 
 
 # --------------------------------------------------------------------------- #
