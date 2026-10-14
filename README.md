@@ -31,41 +31,38 @@ Commands follow git's porcelain/plumbing split:
 ## Usage
 
 `status` mirrors `git status --short [--branch]`: one line per matched file,
-with a state word, and paths relative to the current directory. Each line also
-names the master key(s), compared against the keys the matching rule expects.
+with a coloured state word, and paths relative to the current directory. Each
+line also names the master key(s), compared against the keys the matching rule
+expects.
 
 sops keys have no human name, so each distinct key gets a short **pronoun** of
 the form `<backend>~<index>`, and the pronouns are defined at the top of the
-output. Keys are signed and coloured: `+` (green) is a key the file currently
-has, `-` (red) is a key the rule expects but the file lacks. Files with no drift
-are left uncoloured (white); only drifting or failing files get a colour:
+output. The keys are shown like a diff against `.sops.yaml`: white means the key
+matches, a green `+` is a key the file has that the rule does not, and a red `-`
+is a key the rule expects that the file lacks:
 
 ```console
 $ easy-sops status --branch
 age~0: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 
 ## /repo
-encrypted        secrets/prod.yaml    +age~0
-encrypted        secrets/dev.yaml     +age~0 +age~1
-not encrypted    secrets/extra.yaml   -age~0 -age~1
-need updatekeys  secrets/drift.yaml   +age~0 -age~1
-need rotate      app/rotate.yaml      -age~0 +age~1
-error            data/blob.bin        ?  <sops filestatus message>
+encrypted        config/db.yaml            age~0
+encrypted        secrets/dev.yaml          age~0 age~1
+not encrypted    secrets/extra.yaml        -age~0 -age~1
+need updatekeys  app/extra-key.yaml        +age~0 age~1
+need rotate      secrets/missing-key.yaml  -age~0 age~1
+error            data/blob.bin             ?  <sops filestatus message>
 ```
 
 The state words are named after the sops command that would fix the file:
 
-- **encrypted** — the file's keys match the rule's;
-- **not encrypted** — the rule covers the file, but it is plaintext;
-- **need updatekeys** — the file is missing some keys the rule expects
-  (`sops updatekeys`);
-- **need rotate** — the file has keys the rule no longer expects
-  (`sops rotate`);
-- **error** — `sops filestatus` could not classify the file; the message is
-  appended to that file's own line, so it never disturbs the others.
-
-`need updatekeys` and `need rotate` are highlighted; `error` is red. Files with
-no drift stay white.
+- **encrypted** (green) — no drift: the file's keys match the rule's;
+- **not encrypted** (white) — the rule covers the file, but it is plaintext;
+- **need updatekeys** (yellow) — pure `+` drift: the file carries a key the rule
+  does not list;
+- **need rotate** (yellow) — `-` drift: an expected key is missing;
+- **error** (red) — `sops filestatus` could not classify the file; the message
+  is appended to that file's own line, so it never disturbs the others.
 
 Add `--branch` for the `##` header. Paths are printed relative to the current
 directory by default; pass `--full-name` for repository-root-relative paths.
@@ -74,21 +71,21 @@ paths:
 
 ```console
 $ easy-sops status -- secrets config
-encrypted        secrets/prod.yaml    +age~0
-not encrypted    secrets/extra.yaml   -age~0 -age~1
-need updatekeys  secrets/drift.yaml   +age~0 -age~1
+encrypted        secrets/dev.yaml          age~0 age~1
+not encrypted    secrets/extra.yaml        -age~0 -age~1
+need rotate      secrets/missing-key.yaml  -age~0 age~1
 ```
 
 Machine-readable output mirrors `git status --porcelain`: one `<code>\t<path>`
-line per file, with `E` (encrypted), `U` (unencrypted), `+` (need rotate),
-`-` (need updatekeys) or `!` (error):
+line per file, with `E` (encrypted), `U` (not encrypted), `+` (need updatekeys),
+`-` (need rotate) or `!` (error):
 
 ```console
 $ easy-sops status --porcelain
 !	data/blob.bin
-+	app/rotate.yaml
-E	secrets/prod.yaml
--	secrets/drift.yaml
+E	config/db.yaml
++	app/extra-key.yaml
+-	secrets/missing-key.yaml
 U	secrets/extra.yaml
 ```
 

@@ -76,16 +76,16 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 		'note: forgotten to encrypt' \
 		> $(PLAYGROUND)/secrets/extra.yaml
 	printf '%s\n' \
-		'# matched by the secrets rule, encrypted to one key only while the' \
-		'# rule expects two, so `status` reports `need updatekeys`' \
-		'scope: updatekeys-demo' \
-		> $(PLAYGROUND)/secrets/drift.yaml
+		'# matched by the secrets rule (which expects two keys) but encrypted' \
+		'# to one, so a minus-sign key is missing -> `status` says need rotate' \
+		'scope: missing-key-demo' \
+		> $(PLAYGROUND)/secrets/missing-key.yaml
 	printf '%s\n' \
-		'# matched by the catch-all rule (which expects one key) but' \
-		'# encrypted to a key the rule does not list, so `status`' \
-		'# reports `need rotate`' \
-		'scope: rotate-demo' \
-		> $(PLAYGROUND)/app/rotate.yaml
+		'# matched by the catch-all rule (which expects one key) but encrypted' \
+		'# to an extra key, so it is pure plus-sign drift -> `status` says' \
+		'# need updatekeys' \
+		'scope: extra-key-demo' \
+		> $(PLAYGROUND)/app/extra-key.yaml
 	printf '%s\n' \
 		'# matched by the dot-yaml catch-all rule, left unencrypted' \
 		'debug: false' \
@@ -104,15 +104,13 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/secrets/prod.yaml
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/secrets/dev.yaml
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/config/db.yaml
-	# Encrypt to one key only, although the matching rule expects two, so
-	# this file shows up as `need updatekeys`.
-	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient" --encrypt --in-place $(PLAYGROUND)/secrets/drift.yaml
-	# Encrypt to the *other* key, which the matching rule does not list, so
-	# this file shows up as `need rotate`.
-	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient2" --encrypt --in-place $(PLAYGROUND)/app/rotate.yaml
+	# Missing an expected key -> minus-sign drift -> `need rotate`.
+	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient" --encrypt --in-place $(PLAYGROUND)/secrets/missing-key.yaml
+	# Encrypted to an extra key -> pure plus-sign drift -> `need updatekeys`.
+	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient,$$recipient2" --encrypt --in-place $(PLAYGROUND)/app/extra-key.yaml
 
 	touch $(STAMP)
-	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/drift.yaml (one expected key missing)' '  need rotate:     app/rotate.yaml (encrypted to an unexpected key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:     notes.txt' '  filestatus !:    data/blob.bin' '' 'try: make demo'
+	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need rotate:     secrets/missing-key.yaml (missing an expected key)' '  need updatekeys: app/extra-key.yaml (encrypted to an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:     notes.txt' '  filestatus !:    data/blob.bin' '' 'try: make demo'
 
 playground: $(STAMP)
 

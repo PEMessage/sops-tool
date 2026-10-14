@@ -44,7 +44,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -81,10 +81,10 @@ STATE_ROTATE = "need rotate"
 STATE_ERROR = "error"
 
 STATE_COLOR = {
-    STATE_ENCRYPTED: None,  # no drift -> default (white)
-    STATE_PLAIN: None,
-    STATE_UPDATEKEYS: "yellow",
-    STATE_ROTATE: "yellow",
+    STATE_ENCRYPTED: "green",  # no drift
+    STATE_PLAIN: None,  # no encryption -> default (white)
+    STATE_UPDATEKEYS: "yellow",  # pure-plus drift: encryption has an extra key
+    STATE_ROTATE: "yellow",  # minus drift: an expected key is missing
     STATE_ERROR: "red",
 }
 PORCELAIN_CODE = {
@@ -562,26 +562,30 @@ def _status_entry(
         return StatusEntry(display, STATE_ENCRYPTED, set(), expected, set(), set(), True, None)
 
     extra, missing = actual - expected, expected - actual
-    if extra:
-        state = STATE_ROTATE  # encrypted to keys the rule no longer wants
-    elif missing:
-        state = STATE_UPDATEKEYS  # rule wants keys the file does not have
+    if missing:
+        # A missing key shows as a red `-`: the file needs rotating.
+        state = STATE_ROTATE
+    elif extra:
+        # Only extra keys (all pure-green `+`): needs updatekeys.
+        state = STATE_UPDATEKEYS
     else:
         state = STATE_ENCRYPTED
     return StatusEntry(display, state, actual, expected, extra, missing, False, None)
 
 
 def _key_tokens(entry: StatusEntry, pronouns: Mapping[Key, str]) -> list[tuple[str, str | None]]:
-    """Signed, coloured pronouns: `+` (green) present, `-` (red) expected-but-absent."""
+    """Diff the file's keys against the rule's: white same, green `+` extra, red `-` missing."""
     if entry.unknown:
         return [("?", None)]
     tokens: list[tuple[str, str | None]] = []
     for key in sorted(entry.keys | entry.expected):
         pronoun = pronouns[key]
-        if key in entry.keys:
-            tokens.append((f"+{pronoun}", "green"))
+        if key in entry.keys and key in entry.expected:
+            tokens.append((pronoun, None))  # matches .sops.yaml -> white
+        elif key in entry.keys:
+            tokens.append((f"+{pronoun}", "green"))  # extra vs .sops.yaml
         else:
-            tokens.append((f"-{pronoun}", "red"))
+            tokens.append((f"-{pronoun}", "red"))  # missing vs .sops.yaml
     return tokens or [("-", None)]
 
 
