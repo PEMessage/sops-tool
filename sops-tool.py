@@ -40,13 +40,14 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -339,7 +340,13 @@ def _is_read_error(message: str) -> bool:
     return "error reading file" in lowered or "permission denied" in lowered
 
 
-async def _sops_in_place(config: "Config", sops: str, action: str, path: Path) -> str | None:
+async def _sops_in_place(
+    config: "Config",
+    sops: str,
+    action: str,
+    path: Path,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
     """Run `sops --config … --<action> --in-place`. Returns an error, or None."""
     proc = await asyncio.create_subprocess_exec(
         sops,
@@ -350,11 +357,31 @@ async def _sops_in_place(config: "Config", sops: str, action: str, path: Path) -
         str(path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **env} if env else None,
     )
     _stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
         return _clean_error(stderr.decode(errors="replace"))
     return None
+
+
+def _age_key_env(key_files: Sequence[str]) -> tuple[dict[str, str] | None, Path | None]:
+    """Turn repeated `--age-key-file`s into a `SOPS_AGE_KEY_FILE` env var.
+
+    sops only reads a single identity file, so several are concatenated into a
+    temporary one. Returns ``(env, temporary_file)``.
+    """
+    if not key_files:
+        return None, None
+    paths = [Path(name).expanduser() for name in key_files]
+    if len(paths) == 1:
+        return {"SOPS_AGE_KEY_FILE": str(paths[0].resolve())}, None
+    text = "".join(path.read_text(encoding="utf-8") for path in paths)
+    handle = tempfile.NamedTemporaryFile("w", prefix="sops-tool-age-", suffix=".txt", delete=False)
+    handle.write(text)
+    handle.close()
+    temporary = Path(handle.name)
+    return {"SOPS_AGE_KEY_FILE": str(temporary)}, temporary
 
 
 # --------------------------------------------------------------------------- #
@@ -825,6 +852,13 @@ class DecryptCommand(Subcommand):
     def configure(self, parser: argparse.ArgumentParser) -> None:
         super().configure(parser)
         _action_arguments(parser, "decrypt")
+        parser.add_argument(
+            "--age-key-file",
+            action="append",
+            default=[],
+            metavar="FILE",
+            help="age identity file to decrypt with (repeatable)",
+        )
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
         sops = shutil.which("sops")
@@ -839,31 +873,36 @@ class DecryptCommand(Subcommand):
         width = max(len(state) for state in DECRYPT_COLOR)
         acted = errors = 0
 
-        for path, _rule in matches:
-            display = _display(config, path, args)
-            encrypted, error = await filestatus(path, sops)
+        env, temporary = _age_key_env(args.age_key_file)
+        try:
+            for path, _rule in matches:
+                display = _display(config, path, args)
+                encrypted, error = await filestatus(path, sops)
 
-            if error is not None and _is_read_error(error):
-                _emit_state(color, width, DECRYPT_COLOR, "error", display, error)
-                errors += 1
-                continue
-            if not encrypted:
-                continue  # already plaintext
-            if args.dry_run:
-                _emit_state(color, width, DECRYPT_COLOR, "would decrypt", display)
-                acted += 1
-                continue
-            if args.interactive and not await _confirm("decrypt", display):
-                _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
-                continue
+                if error is not None and _is_read_error(error):
+                    _emit_state(color, width, DECRYPT_COLOR, "error", display, error)
+                    errors += 1
+                    continue
+                if not encrypted:
+                    continue  # already plaintext
+                if args.dry_run:
+                    _emit_state(color, width, DECRYPT_COLOR, "would decrypt", display)
+                    acted += 1
+                    continue
+                if args.interactive and not await _confirm("decrypt", display):
+                    _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
+                    continue
 
-            failure = await _sops_in_place(config, sops, "decrypt", path)
-            if failure is None:
-                _emit_state(color, width, DECRYPT_COLOR, "decrypted", display)
-                acted += 1
-            else:
-                _emit_state(color, width, DECRYPT_COLOR, "error", display, failure)
-                errors += 1
+                failure = await _sops_in_place(config, sops, "decrypt", path, env)
+                if failure is None:
+                    _emit_state(color, width, DECRYPT_COLOR, "decrypted", display)
+                    acted += 1
+                else:
+                    _emit_state(color, width, DECRYPT_COLOR, "error", display, failure)
+                    errors += 1
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
         if acted == 0 and errors == 0:
             print("nothing to decrypt")

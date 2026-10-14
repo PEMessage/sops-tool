@@ -179,8 +179,8 @@ dry-run: $(STAMP)
 	@$(SOPS_TOOL) -C $(PLAYGROUND) encrypt --dry-run || true
 
 decrypt: $(STAMP)
-	@cat $(PLAYGROUND)/keys/age*.txt > $(PLAYGROUND)/.agekeys
-	@SOPS_AGE_KEY_FILE=$(CURDIR)/$(PLAYGROUND)/.agekeys $(SOPS_TOOL) -C $(PLAYGROUND) decrypt || true
+	@$(SOPS_TOOL) -C $(PLAYGROUND) decrypt \
+		$(foreach key,$(wildcard $(PLAYGROUND)/keys/age*.txt),--age-key-file $(key)) || true
 
 decrypt-dry-run: $(STAMP)
 	@$(SOPS_TOOL) -C $(PLAYGROUND) decrypt --dry-run || true
