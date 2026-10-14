@@ -49,21 +49,24 @@ age~0: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 encrypted        config/db.yaml            age~0
 encrypted        secrets/dev.yaml          age~0 age~1
 not encrypted    secrets/extra.yaml        +age~0 +age~1
+not encrypted    kek/age.txt               +age~0 +age~1
 need updatekeys  secrets/missing-key.yaml  +age~0 age~1
 need rotate      app/extra-key.yaml        -age~0 age~1
-error            data/blob.bin             ?  <sops filestatus message>
+error            data/broken.yaml          ?  <sops filestatus message>
 ```
 
 The state words are named after the sops command that would fix the file:
 
 - **encrypted** (green) — no drift: the file's keys match the rule's;
-- **not encrypted** (white) — the rule covers the file, but it is plaintext;
+- **not encrypted** (white) — the rule covers the file, but it is plaintext (or
+  sops cannot parse it as a sops document at all);
 - **need updatekeys** (yellow) — `+` drift: the rule wants a key the file lacks
   (`sops updatekeys` adds it);
 - **need rotate** (yellow) — `-` drift: the file carries a key the rule does not
   list (`sops rotate`);
-- **error** (red) — `sops filestatus` could not classify the file; the message
-  is appended to that file's own line, so it never disturbs the others.
+- **error** (red) — `sops filestatus` could not *read* the file (a broken
+  symlink, a permission problem, …); the message is appended to that file's own
+  line, so it never disturbs the others.
 
 Add `--branch` for the `##` header. Paths are printed relative to the current
 directory by default; pass `--full-name` for repository-root-relative paths.
@@ -122,15 +125,16 @@ $ make clean        # delete it
 
 The sandbox contains several kinds of files on purpose: correctly encrypted
 ones (including one with two keys), a file that is `need updatekeys`, a file
-that is `need rotate`, plaintext files still caught by a rule, a file matched by
-no rule, and a binary that `sops filestatus` cannot classify. It also shows
+that is `need rotate`, plaintext files still caught by a rule, a key file and a
+binary that sops cannot parse (both reported as `not encrypted`), a file matched
+by no rule, and an unreadable symlink that shows up as `error`. It also shows
 first-match win ordering between a specific `^secrets/prod\.yaml$` rule and
 broader ones.
 
 The age master keys — the KEKs (key encryption keys) that sops unlocks a file's
-data key with — live in `kek/`. They are regenerated on every `make reset`, and
-are deliberately *not* covered by any creation rule: you do not encrypt a KEK
-with itself.
+data key with — live in `kek/`. They are regenerated on every `make reset` and
+are listed by `status` through their own `^kek/` rule (as plaintext; a KEK is
+never encrypted with itself).
 
 ## Matching semantics
 

@@ -44,7 +44,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -268,6 +268,12 @@ def _clean_error(stderr: str) -> str:
     if not match:
         return lines[-1]
     return match.group(1).replace('\\"', '"').replace("\\n", " ").replace("\\\\", "\\")
+
+
+def _is_read_error(message: str) -> bool:
+    """True when sops failed to *read* the file, rather than to parse it."""
+    lowered = message.lower()
+    return "error reading file" in lowered or "permission denied" in lowered
 
 
 # --------------------------------------------------------------------------- #
@@ -554,9 +560,11 @@ def _status_entry(
     expected = rule.keys()
     display = _display(config, path, args)
 
-    if error is not None:
+    if error is not None and _is_read_error(error):
         return StatusEntry(display, STATE_ERROR, set(), expected, set(), set(), True, error)
-    if not encrypted:
+    if error is not None or not encrypted:
+        # sops could not parse the file, or it simply is not encrypted: either
+        # way it is not a sops document, so report it as plaintext.
         return StatusEntry(display, STATE_PLAIN, set(), expected, set(), set(expected), False, None)
     if actual is None:
         return StatusEntry(display, STATE_ENCRYPTED, set(), expected, set(), set(), True, None)

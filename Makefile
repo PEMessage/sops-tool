@@ -51,6 +51,8 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 		'    age: __RECIPIENT__' \
 		'  - path_regex: ^data/' \
 		'    age: __RECIPIENT__' \
+		'  - path_regex: ^kek/' \
+		'    age: __RECIPIENT__,__RECIPIENT2__' \
 		> $(PLAYGROUND)/.sops.yaml
 	sed -i -e "s|__RECIPIENT2__|$$recipient2|g" -e "s|__RECIPIENT__|$$recipient|g" $(PLAYGROUND)/.sops.yaml
 
@@ -100,6 +102,8 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 		> $(PLAYGROUND)/notes.txt
 
 	head -c 64 /dev/urandom > $(PLAYGROUND)/data/blob.bin
+	# A broken symlink: sops cannot read it, so `status` reports `error`.
+	ln -sf missing-target $(PLAYGROUND)/data/broken.yaml
 
 	# sops looks for .sops.yaml relative to the cwd, so point it at the sandbox.
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/secrets/prod.yaml
@@ -111,7 +115,7 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient,$$recipient2" --encrypt --in-place $(PLAYGROUND)/app/extra-key.yaml
 
 	touch $(STAMP)
-	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:     notes.txt' '  kek (keys):      kek/age.txt, kek/age2.txt (sops age keys, not rule-covered)' '  filestatus !:    data/blob.bin' '' 'try: make demo'
+	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml, data/blob.bin' '  kek (covered):   kek/age.txt, kek/age2.txt (the sops age keys)' '  not matched:     notes.txt' '  error:           data/broken.yaml (unreadable symlink)' '' 'try: make demo'
 
 playground: $(STAMP)
 
