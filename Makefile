@@ -1,4 +1,4 @@
-# easy-sops playground
+# sops-tool playground
 #
 # `make playground` builds a throwaway sandbox under ./playground/ (kept out of
 # git) so you can try every command without touching real secrets.
@@ -14,7 +14,7 @@
 
 PLAYGROUND := playground
 STAMP      := $(PLAYGROUND)/.ready
-EASY_SOPS  ?= $(CURDIR)/easy-sops.py
+SOPS_TOOL  ?= $(CURDIR)/sops-tool.py
 SOPS       ?= sops
 AGE_KEYGEN ?= age-keygen
 
@@ -26,12 +26,12 @@ SHELL       := bash
 .ONESHELL:
 .DEFAULT_GOAL := help
 
-.PHONY: help playground demo status porcelain ls-rules ls-files match encrypt dry-run clean reset
+.PHONY: help playground demo status porcelain ls-rules ls-files match encrypt dry-run decrypt decrypt-dry-run clean reset
 
 help:
-	@printf '%s\n' '' 'easy-sops playground' '' '  make playground   build ./$(PLAYGROUND)/ with sample rules and secrets' '  make demo         build it, then run every command against it' '  make status       easy-sops -C $(PLAYGROUND) status' '  make porcelain    easy-sops -C $(PLAYGROUND) status --porcelain' '  make ls-rules     list the sample creation rules' '  make ls-files     list files caught by the rules' '  make match        rule for FILE (default: $(FILE))' '  make encrypt      encrypt the not-yet-encrypted files in place' '  make dry-run      same, but only print what would be encrypted' '  make clean        remove ./$(PLAYGROUND)/' '  make reset        clean, then rebuild' ''
+	@printf '%s\n' '' 'sops-tool playground' '' '  make playground    build ./$(PLAYGROUND)/ with sample rules and secrets' '  make demo          build it, then run every command against it' '  make status        sops-tool -C $(PLAYGROUND) status' '  make porcelain     sops-tool -C $(PLAYGROUND) status --porcelain' '  make ls-rules      list the sample creation rules' '  make ls-files      list files caught by the rules' '  make match         rule for FILE (default: $(FILE))' '  make encrypt       encrypt the not-yet-encrypted files in place' '  make decrypt       decrypt the encrypted files in place (uses keys/)' '  make dry-run       encrypt --dry-run: only print what would change' '  make decrypt-dry-run  decrypt --dry-run' '  make clean         remove ./$(PLAYGROUND)/' '  make reset         clean, then rebuild' ''
 
-$(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
+$(STAMP): $(SOPS_TOOL) $(MAKEFILE_LIST)
 	@rm -rf $(PLAYGROUND)
 	mkdir -p $(PLAYGROUND)/secrets $(PLAYGROUND)/config $(PLAYGROUND)/app $(PLAYGROUND)/deploy/prod $(PLAYGROUND)/keys $(PLAYGROUND)/kek $(PLAYGROUND)/data
 
@@ -46,7 +46,7 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 		'# Sample config. Rules are tried in order; the first match wins.' \
 		'# Two ways to give a key to a rule:' \
 		'#   - named up top: `keys:` + &anchor, referenced as *alias;' \
-		'#   - inline: a bare recipient literal, which has no name, so easy-sops' \
+		'#   - inline: a bare recipient literal, which has no name, so sops-tool' \
 		'#     shows it with a generated `backend~index` pronoun instead.' \
 		'keys:' \
 		'  admin: &admin __RECIPIENT__' \
@@ -112,7 +112,7 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 		'replicas: 3' \
 		> $(PLAYGROUND)/deploy/prod/values.yaml
 	printf '%s\n' \
-		'not matched by any rule, so easy-sops never lists this file' \
+		'not matched by any rule, so sops-tool never lists this file' \
 		> $(PLAYGROUND)/notes.txt
 	# `kek/` is just special *data*: a .txt encrypted by a key. The real sops
 	# keys live in keys/ and are deliberately not covered by any rule.
@@ -143,40 +143,47 @@ playground: $(STAMP)
 
 demo: $(STAMP)
 	@printf '\n=== root ===\n'
-	$(EASY_SOPS) -C $(PLAYGROUND) root
+	$(SOPS_TOOL) -C $(PLAYGROUND) root
 	printf '\n=== ls-rules ===\n'
-	$(EASY_SOPS) -C $(PLAYGROUND) ls-rules
+	$(SOPS_TOOL) -C $(PLAYGROUND) ls-rules
 	printf '\n=== ls-files ===\n'
-	$(EASY_SOPS) -C $(PLAYGROUND) ls-files
+	$(SOPS_TOOL) -C $(PLAYGROUND) ls-files
 	printf '\n=== match secrets/dev.yaml ===\n'
-	$(EASY_SOPS) -C $(PLAYGROUND) match secrets/dev.yaml
+	$(SOPS_TOOL) -C $(PLAYGROUND) match secrets/dev.yaml
 	printf '\n=== match notes.txt (unmatched, exits 1) ===\n'
-	$(EASY_SOPS) -C $(PLAYGROUND) match notes.txt || true
+	$(SOPS_TOOL) -C $(PLAYGROUND) match notes.txt || true
 	printf '\n=== status --branch ===\n'
-	$(EASY_SOPS) -C $(PLAYGROUND) status --branch
+	$(SOPS_TOOL) -C $(PLAYGROUND) status --branch
 	printf '\n=== status --porcelain ===\n'
-	$(EASY_SOPS) -C $(PLAYGROUND) status --porcelain
+	$(SOPS_TOOL) -C $(PLAYGROUND) status --porcelain
 
 status: $(STAMP)
-	@$(EASY_SOPS) -C $(PLAYGROUND) status
+	@$(SOPS_TOOL) -C $(PLAYGROUND) status
 
 porcelain: $(STAMP)
-	@$(EASY_SOPS) -C $(PLAYGROUND) status --porcelain
+	@$(SOPS_TOOL) -C $(PLAYGROUND) status --porcelain
 
 ls-rules: $(STAMP)
-	@$(EASY_SOPS) -C $(PLAYGROUND) ls-rules
+	@$(SOPS_TOOL) -C $(PLAYGROUND) ls-rules
 
 ls-files: $(STAMP)
-	@$(EASY_SOPS) -C $(PLAYGROUND) ls-files
+	@$(SOPS_TOOL) -C $(PLAYGROUND) ls-files
 
 match: $(STAMP)
-	@$(EASY_SOPS) -C $(PLAYGROUND) match $(FILE)
+	@$(SOPS_TOOL) -C $(PLAYGROUND) match $(FILE)
 
 encrypt: $(STAMP)
-	@$(EASY_SOPS) -C $(PLAYGROUND) encrypt || true
+	@$(SOPS_TOOL) -C $(PLAYGROUND) encrypt || true
 
 dry-run: $(STAMP)
-	@$(EASY_SOPS) -C $(PLAYGROUND) encrypt --dry-run || true
+	@$(SOPS_TOOL) -C $(PLAYGROUND) encrypt --dry-run || true
+
+decrypt: $(STAMP)
+	@cat $(PLAYGROUND)/keys/age*.txt > $(PLAYGROUND)/.agekeys
+	@SOPS_AGE_KEY_FILE=$(CURDIR)/$(PLAYGROUND)/.agekeys $(SOPS_TOOL) -C $(PLAYGROUND) decrypt || true
+
+decrypt-dry-run: $(STAMP)
+	@$(SOPS_TOOL) -C $(PLAYGROUND) decrypt --dry-run || true
 
 clean:
 	@rm -rf $(PLAYGROUND)

@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["PyYAML>=6.0"]
 # ///
-"""easy-sops: a tiny, git-style front-end for sops.
+"""sops-tool: a tiny, git-style front-end for sops.
 
 Every command runs against a *repository*: the nearest `.sops.yaml` found by
 walking up from the current directory. `-C DIR` starts the search (and resolves
@@ -24,8 +24,9 @@ plumbing
 porcelain
   status     report whether matched files are encrypted
   encrypt    encrypt matched, not-yet-encrypted files in place
+  decrypt    decrypt matched, still-encrypted files in place
 
-Commands accept `--` before paths, like git: `easy-sops status -- secrets/`.
+Commands accept `--` before paths, like git: `sops-tool status -- secrets/`.
 Paths are printed relative to the current directory by default; pass
 `--full-name` for repository-root-relative paths.
 """
@@ -45,7 +46,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -338,13 +339,13 @@ def _is_read_error(message: str) -> bool:
     return "error reading file" in lowered or "permission denied" in lowered
 
 
-async def _encrypt(config: "Config", sops: str, path: Path) -> str | None:
-    """Encrypt one file in place with the repository config. Returns an error."""
+async def _sops_in_place(config: "Config", sops: str, action: str, path: Path) -> str | None:
+    """Run `sops --config … --<action> --in-place`. Returns an error, or None."""
     proc = await asyncio.create_subprocess_exec(
         sops,
         "--config",
         str(config.path),
-        "--encrypt",
+        f"--{action}",
         "--in-place",
         str(path),
         stdout=asyncio.subprocess.PIPE,
@@ -591,7 +592,7 @@ class StatusCommand(Subcommand):
     async def run(self, config: Config, args: argparse.Namespace) -> int:
         sops = shutil.which("sops")
         if sops is None:
-            print("easy-sops: sops not found in PATH", file=sys.stderr)
+            print("sops-tool: sops not found in PATH", file=sys.stderr)
             return 127
 
         roots = [_resolve(path, args) for path in args.paths]
@@ -723,7 +724,7 @@ def _print_status(
 
 
 # --------------------------------------------------------------------------- #
-# porcelain: encrypt
+# porcelain: encrypt / decrypt
 # --------------------------------------------------------------------------- #
 ENCRYPT_COLOR = {
     "encrypted": "green",
@@ -731,16 +732,36 @@ ENCRYPT_COLOR = {
     "skipped": None,
     "error": "red",
 }
+DECRYPT_COLOR = {
+    "decrypted": "green",
+    "would decrypt": "yellow",
+    "skipped": None,
+    "error": "red",
+}
 
 
-def _emit_state(color: bool, width: int, state: str, path: str, detail: str | None = None) -> None:
-    label = _paint(state.ljust(width), ENCRYPT_COLOR.get(state), color)
+def _emit_state(
+    color: bool,
+    width: int,
+    palette: Mapping[str, str | None],
+    state: str,
+    path: str,
+    detail: str | None = None,
+) -> None:
+    label = _paint(state.ljust(width), palette.get(state), color)
     print(f"{label}  {path}" + (f"  {detail}" if detail else ""))
 
 
-async def _confirm(display: str) -> bool:
-    answer = await asyncio.to_thread(input, f"encrypt {display}? [y/N] ")
+async def _confirm(verb: str, display: str) -> bool:
+    answer = await asyncio.to_thread(input, f"{verb} {display}? [y/N] ")
     return answer.strip().lower() in {"y", "yes"}
+
+
+def _action_arguments(parser: argparse.ArgumentParser, verb: str) -> None:
+    path_argument(parser, "limit to these paths")
+    parser.add_argument("-n", "--dry-run", action="store_true", help=f"only show what would be {verb}ed")
+    parser.add_argument("-i", "--interactive", action="store_true", help=f"confirm each file before {verb}ing")
+    parser.add_argument("--full-name", action="store_true", help="show paths relative to the repository root")
 
 
 @subcommand
@@ -750,15 +771,12 @@ class EncryptCommand(Subcommand):
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
         super().configure(parser)
-        path_argument(parser, "limit to these paths")
-        parser.add_argument("-n", "--dry-run", action="store_true", help="only show what would be encrypted")
-        parser.add_argument("-i", "--interactive", action="store_true", help="confirm each file before encrypting")
-        parser.add_argument("--full-name", action="store_true", help="show paths relative to the repository root")
+        _action_arguments(parser, "encrypt")
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
         sops = shutil.which("sops")
         if sops is None:
-            print("easy-sops: sops not found in PATH", file=sys.stderr)
+            print("sops-tool: sops not found in PATH", file=sys.stderr)
             return 127
 
         roots = [_resolve(path, args) for path in args.paths]
@@ -773,29 +791,82 @@ class EncryptCommand(Subcommand):
             encrypted, error = await filestatus(path, sops)
 
             if error is not None and _is_read_error(error):
-                _emit_state(color, width, "error", display, error)
+                _emit_state(color, width, ENCRYPT_COLOR, "error", display, error)
                 errors += 1
                 continue
             if encrypted:
                 continue  # already a sops document
             if args.dry_run:
-                _emit_state(color, width, "would encrypt", display)
+                _emit_state(color, width, ENCRYPT_COLOR, "would encrypt", display)
                 acted += 1
                 continue
-            if args.interactive and not await _confirm(display):
-                _emit_state(color, width, "skipped", display)
+            if args.interactive and not await _confirm("encrypt", display):
+                _emit_state(color, width, ENCRYPT_COLOR, "skipped", display)
                 continue
 
-            failure = await _encrypt(config, sops, path)
+            failure = await _sops_in_place(config, sops, "encrypt", path)
             if failure is None:
-                _emit_state(color, width, "encrypted", display)
+                _emit_state(color, width, ENCRYPT_COLOR, "encrypted", display)
                 acted += 1
             else:
-                _emit_state(color, width, "error", display, failure)
+                _emit_state(color, width, ENCRYPT_COLOR, "error", display, failure)
                 errors += 1
 
         if acted == 0 and errors == 0:
             print("nothing to encrypt")
+        return 1 if errors else 0
+
+
+@subcommand
+class DecryptCommand(Subcommand):
+    name = "decrypt"
+    help = "decrypt, in place, every matched file that is encrypted"
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        super().configure(parser)
+        _action_arguments(parser, "decrypt")
+
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        sops = shutil.which("sops")
+        if sops is None:
+            print("sops-tool: sops not found in PATH", file=sys.stderr)
+            return 127
+
+        roots = [_resolve(path, args) for path in args.paths]
+        matches = [entry async for entry in config.files(roots)]
+
+        color = sys.stdout.isatty()
+        width = max(len(state) for state in DECRYPT_COLOR)
+        acted = errors = 0
+
+        for path, _rule in matches:
+            display = _display(config, path, args)
+            encrypted, error = await filestatus(path, sops)
+
+            if error is not None and _is_read_error(error):
+                _emit_state(color, width, DECRYPT_COLOR, "error", display, error)
+                errors += 1
+                continue
+            if not encrypted:
+                continue  # already plaintext
+            if args.dry_run:
+                _emit_state(color, width, DECRYPT_COLOR, "would decrypt", display)
+                acted += 1
+                continue
+            if args.interactive and not await _confirm("decrypt", display):
+                _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
+                continue
+
+            failure = await _sops_in_place(config, sops, "decrypt", path)
+            if failure is None:
+                _emit_state(color, width, DECRYPT_COLOR, "decrypted", display)
+                acted += 1
+            else:
+                _emit_state(color, width, DECRYPT_COLOR, "error", display, failure)
+                errors += 1
+
+        if acted == 0 and errors == 0:
+            print("nothing to decrypt")
         return 1 if errors else 0
 
 
@@ -804,7 +875,7 @@ class EncryptCommand(Subcommand):
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="easy-sops",
+        prog="sops-tool",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -827,7 +898,7 @@ async def run(args: argparse.Namespace) -> int:
     try:
         config = await Config.discover(Path(args.directory) if args.directory else None)
     except ConfigError as exc:
-        print(f"easy-sops: {exc}", file=sys.stderr)
+        print(f"sops-tool: {exc}", file=sys.stderr)
         return 2
     return await args.command.run(config, args)
 

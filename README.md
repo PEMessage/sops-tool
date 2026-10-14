@@ -1,4 +1,4 @@
-# easy-sops
+# sops-tool
 
 A tiny, git-style front-end for [sops](https://github.com/getsops/sops),
 packaged as one executable script using an inline [uv](https://docs.astral.sh/uv/)
@@ -28,6 +28,7 @@ Commands follow git's porcelain/plumbing split:
 | plumbing  | `match`    | print the rule for a path (exit 1 if none)         |
 | porcelain | `status`   | report whether matched files are encrypted         |
 | porcelain | `encrypt`  | encrypt matched files that are not encrypted yet    |
+| porcelain | `decrypt`  | decrypt matched files that are encrypted            |
 
 ## Usage
 
@@ -58,7 +59,7 @@ but the file lacks, and a red `-` is a key the file has but `.sops.yaml` does
 not:
 
 ```console
-$ easy-sops status --branch
+$ sops-tool status --branch
 admin:  age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 age~0:  age1azjar2evsuakyv9cjg66vhzvy3uwkw7uvu54fm9ewp9e4petdpkqzzpqrh
 backup: age1ck8af8dr5yq3j8sea5jxg58vvjmth6m80gq5tf2n09ztfqfrxd0stl8awd
@@ -92,7 +93,7 @@ Like git, a `--` separates options from paths, which limits the report to those
 paths:
 
 ```console
-$ easy-sops status -- secrets config
+$ sops-tool status -- secrets config
 encrypted        secrets/dev.yaml          admin backup
 not encrypted    secrets/extra.yaml        +admin +backup
 need updatekeys  secrets/missing-key.yaml  +backup admin
@@ -103,7 +104,7 @@ line per file, with `E` (encrypted), `U` (not encrypted), `+` (need updatekeys),
 `-` (need rotate) or `!` (error):
 
 ```console
-$ easy-sops status --porcelain
+$ sops-tool status --porcelain
 !	data/broken.yaml
 E	config/db.yaml
 U	data/blob.bin
@@ -117,32 +118,46 @@ the same `--` path filter, and `-n/--dry-run` prints what it would do without
 touching anything:
 
 ```console
-$ easy-sops encrypt --dry-run -- secrets
+$ sops-tool encrypt --dry-run -- secrets
 would encrypt  secrets/extra.yaml
 
-$ easy-sops encrypt -- secrets
+$ sops-tool encrypt -- secrets
 encrypted      secrets/extra.yaml
 ```
 
 Use `-i/--interactive` to confirm each file one at a time:
 
 ```console
-$ easy-sops encrypt -i
+$ sops-tool encrypt -i
 encrypt secrets/extra.yaml? [y/N] y
 encrypted      secrets/extra.yaml
 ```
 
+`decrypt` is the mirror image: it decrypts, in place, every matched file that is
+encrypted. It needs a private key, which sops finds the usual way
+(`SOPS_AGE_KEY_FILE` and friends):
+
+```console
+$ SOPS_AGE_KEY_FILE=keys/age.txt sops-tool decrypt -- secrets
+decrypted      secrets/dev.yaml
+decrypted      secrets/missing-key.yaml
+decrypted      secrets/prod.yaml
+```
+
+It takes the same `--` path filter and `-n/--dry-run` / `-i/--interactive`
+flags.
+
 Plumbing is stable and script-friendly:
 
 ```console
-$ easy-sops root
+$ sops-tool root
 /repo
 
-$ easy-sops ls-rules
+$ sops-tool ls-rules
 #0	^secrets/.*\.yaml$	age
 #1	.*\.yaml$	pgp,kms
 
-$ easy-sops match secrets/prod.yaml
+$ sops-tool match secrets/prod.yaml
 #0
 ```
 
@@ -179,9 +194,9 @@ Two folders make the key story concrete:
   that is itself encrypted by one of the keys (`kek/data.txt`), so `status`
   lists it like any other encrypted file.
 
-`make encrypt` encrypts the sandbox's still-plaintext files in place (and
-`make dry-run` only prints what it would do); `keys/` is untouched because no
-rule covers it.
+`make encrypt` encrypts the sandbox's still-plaintext files in place, and
+`make decrypt` reverses it (using `keys/`); the `dry-run` variants only print
+what would happen. `keys/` is untouched by both, because no rule covers it.
 
 ## Matching semantics
 
