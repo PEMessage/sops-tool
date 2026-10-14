@@ -35,8 +35,9 @@ with a coloured state word, and paths relative to the current directory. Each
 line also names the master key(s), compared against the keys the matching rule
 expects.
 
-A key can be given a human name in `.sops.yaml`, either through a top-level
-`keys:` map (which sops ignores) or a YAML anchor, and referenced by alias:
+A key can be given a human name in `.sops.yaml` — through a top-level `keys:`
+map (which sops ignores) or a YAML anchor — and referenced by alias. A rule can
+also just inline the bare recipient, in which case the key has no name:
 
 ```yaml
 keys:
@@ -44,6 +45,8 @@ keys:
 creation_rules:
   - path_regex: ^secrets/
     age: *admin
+  - path_regex: \.yaml$
+    age: age1azjar2evsuakyv9cjg66vhzvy3uwkw7uvu54fm9ewp9e4petdpkqzzpqrh
 ```
 
 `status` labels a named key by that name; a key without one gets a short
@@ -56,15 +59,16 @@ not:
 ```console
 $ easy-sops status --branch
 admin:  age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+age~0:  age1azjar2evsuakyv9cjg66vhzvy3uwkw7uvu54fm9ewp9e4petdpkqzzpqrh
 backup: age1ck8af8dr5yq3j8sea5jxg58vvjmth6m80gq5tf2n09ztfqfrxd0stl8awd
 
 ## /repo
-encrypted        config/db.yaml            admin
+encrypted        config/db.yaml            age~0
 encrypted        secrets/dev.yaml          admin backup
 not encrypted    secrets/extra.yaml        +admin +backup
 not encrypted    kek/age.txt               +admin +backup
-need updatekeys  secrets/missing-key.yaml  +backup admin
-need rotate      app/extra-key.yaml        -backup admin
+need updatekeys  secrets/missing-key.yaml  admin +backup
+need rotate      app/extra-key.yaml        -admin +age~0 -backup
 error            data/broken.yaml          ?  <sops filestatus message>
 ```
 
