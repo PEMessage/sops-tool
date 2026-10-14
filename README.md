@@ -87,13 +87,14 @@ The state words are named after the sops command that would fix the file:
   symlink, a permission problem, …); the message is appended to that file's own
   line, so it never disturbs the others.
 
-Pass `--age-key-file FILE` (repeatable) to tell `status` which keys you can
-decrypt with. `status` reads only this flag, never the ambient environment, so
-its output stays deterministic. Those keys are highlighted in the legend
-(orange), and a final `*name` column marks each file one of them opens:
+Add `--decrypt-check` to have `status` also mark which of your keys can decrypt
+each file. The available keys — from `--age-key-file FILE` (repeatable) and the
+`SOPS_AGE_KEY*` environment — are highlighted in the legend (orange), and a
+final `*name` column marks each file one of them opens. Without
+`--decrypt-check`, `status` ignores keys entirely and stays deterministic:
 
 ```console
-$ sops-tool status --age-key-file keys/age.txt
+$ sops-tool status --decrypt-check --age-key-file keys/age.txt
 admin:  age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 age~0:  age1azjar2evsuakyv9cjg66vhzvy3uwkw7uvu54fm9ewp9e4petdpkqzzpqrh
 backup: age1ck8af8dr5yq3j8sea5jxg58vvjmth6m80gq5tf2n09ztfqfrxd0stl8awd
@@ -149,30 +150,33 @@ encrypt secrets/extra.yaml? [y/N] y
 encrypted      secrets/extra.yaml
 ```
 
-`decrypt` decrypts, in place, the matched files that one of *your* keys opens.
-It shows the same view as `status`; on top of `--age-key-file` it also honours
-the `SOPS_AGE_KEY*` environment, since that is what sops will actually use. A
-real run decrypts the files carrying a `*` and reports them as `decrypted`:
+`decrypt` is a thin wrapper over `sops --decrypt`: for every matched file that is
+encrypted it *always* tries to decrypt, and reports whatever sops says —
+`decrypted`, `would decrypt` (dry-run), or `error <message>`. There is no
+"smart" filtering; a missing key is simply an error:
 
 ```console
-$ sops-tool decrypt --age-key-file keys/age.txt
-admin:  age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
-age~0:  age1azjar2evsuakyv9cjg66vhzvy3uwkw7uvu54fm9ewp9e4petdpkqzzpqrh
-backup: age1ck8af8dr5yq3j8sea5jxg58vvjmth6m80gq5tf2n09ztfqfrxd0stl8awd
+$ sops-tool decrypt -n
+error          secrets/dev.yaml          but none were.
+error          secrets/missing-key.yaml  but none were.
+error          secrets/prod.yaml         but none were.
 
-decrypted        secrets/dev.yaml          admin backup           *admin
-decrypted        secrets/missing-key.yaml  admin +backup          *admin
-encrypted        config/db.yaml            age~0
+$ SOPS_AGE_KEY_FILE=keys/age.txt sops-tool decrypt
+decrypted      secrets/dev.yaml
+decrypted      secrets/missing-key.yaml
+decrypted      secrets/prod.yaml
 ```
 
-It takes the same `--` path filter, the same `-n/--dry-run` / `-i/--interactive`
-flags, and the same `--age-key-file`.
-
-sops itself accepts the age private key only through the `SOPS_AGE_KEY*`
+It takes the same `--` path filter and `-n/--dry-run` / `-i/--interactive`
+flags. sops itself accepts the age private key only through the `SOPS_AGE_KEY*`
 environment variables or a key service — there is no CLI flag for it (`--age`
 is for *encryption* recipients). `--age-key-file FILE` (repeatable; several
 files are merged into one) is a convenience that `sops-tool` forwards to sops as
-`SOPS_AGE_KEY_FILE`; without it, the environment is inherited as usual.
+`SOPS_AGE_KEY_FILE`; without it, the environment is inherited as usual (so
+`SOPS_AGE_KEY`, `SOPS_AGE_KEY_FILE` and friends all work).
+
+The "smart" view — which of your keys can open which file — is
+`status --decrypt-check` (see above), not `decrypt`.
 
 Plumbing is stable and script-friendly:
 

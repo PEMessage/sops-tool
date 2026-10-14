@@ -24,13 +24,13 @@ plumbing
 porcelain
   status     report whether matched files are encrypted
   encrypt    encrypt matched, not-yet-encrypted files in place
-  decrypt    decrypt the matched files the given keys can open
+  decrypt    decrypt matched files in place (a thin `sops` wrapper)
 
-`status` and `decrypt` share one view over the repository: every matched file,
-its keys, and whether one of *your* keys opens it. `status` counts only the
-`--age-key-file`s you name (never the ambient environment, so it is
-deterministic); `decrypt` also honours `SOPS_AGE_KEY*` (what sops actually
-uses) and, beyond showing the view, decrypts the files a key matched.
+`status` reports every matched file, its keys and its encryption state; with
+`--decrypt-check` it additionally highlights the keys you can decrypt with
+(`--age-key-file`, or `SOPS_AGE_KEY*`) and marks the files they open.
+`decrypt` does not share that view: it is a thin wrapper that simply runs
+`sops --decrypt` on the matched files and reports what sops says.
 
 Commands accept `--` before paths, like git: `sops-tool status -- secrets/`.
 Paths are printed relative to the current directory by default; pass
@@ -53,7 +53,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -355,21 +355,21 @@ def _is_read_error(message: str) -> bool:
     return "error reading file" in lowered or "permission denied" in lowered
 
 
-async def _sops_in_place(
+async def _run_sops(
     config: "Config",
     sops: str,
     action: str,
     path: Path,
     env: Mapping[str, str] | None = None,
+    in_place: bool = True,
 ) -> str | None:
-    """Run `sops --config … --<action> --in-place`. Returns an error, or None."""
+    """Run `sops --config … --<action> [--in-place] <path>`. Returns an error."""
+    command = [sops, "--config", str(config.path), f"--{action}"]
+    if in_place:
+        command.append("--in-place")
+    command.append(str(path))
     proc = await asyncio.create_subprocess_exec(
-        sops,
-        "--config",
-        str(config.path),
-        f"--{action}",
-        "--in-place",
-        str(path),
+        *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=_child_env(env),
@@ -671,11 +671,16 @@ class StatusCommand(Subcommand):
             help="show paths relative to the repository root",
         )
         parser.add_argument(
+            "--decrypt-check",
+            action="store_true",
+            help="also mark which of your keys can decrypt each file",
+        )
+        parser.add_argument(
             "--age-key-file",
             action="append",
             default=[],
             metavar="FILE",
-            help="age identity file whose keys are marked/checked (repeatable)",
+            help="age identity file to check against (with --decrypt-check; repeatable)",
         )
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
@@ -686,6 +691,9 @@ class StatusCommand(Subcommand):
 
         roots = [_resolve(path, args) for path in args.paths]
         key_files = _resolve_key_files(args)
+        available = (
+            _available_age_keys(key_files, include_env=True) if args.decrypt_check else set()
+        )
 
         entries = await _collect_entries(config, roots, sops, args)
 
@@ -694,12 +702,7 @@ class StatusCommand(Subcommand):
                 print(f"{PORCELAIN_CODE[entry.state]}\t{entry.path}")
             return 0
 
-        _print_report(
-            entries,
-            config.key_names,
-            _available_age_keys(key_files),
-            config.root if args.branch else None,
-        )
+        _print_report(entries, config.key_names, available, config.root if args.branch else None)
         return 0
 
 
@@ -843,28 +846,15 @@ def _print_report(
 # --------------------------------------------------------------------------- #
 # porcelain: encrypt / decrypt
 # --------------------------------------------------------------------------- #
-async def _decrypt_entries(
-    config: Config,
-    entries: Sequence[StatusEntry],
-    sops: str,
-    env: Mapping[str, str] | None,
-    available: set[Key],
-    args: argparse.Namespace,
-) -> None:
-    """Decrypt, in place, every entry one of our own keys opens."""
-    decryptable = {STATE_ENCRYPTED, STATE_UPDATEKEYS, STATE_ROTATE}
-    for entry in entries:
-        if entry.state not in decryptable or not entry.keys & available:
-            continue
-        if args.interactive and not await _confirm("decrypt", entry.path):
-            continue
-        if await _sops_in_place(config, sops, "decrypt", entry.source, env) is None:
-            entry.state = STATE_DECRYPTED
-
-
 ENCRYPT_COLOR = {
     "encrypted": "green",
     "would encrypt": "yellow",
+    "skipped": None,
+    "error": "red",
+}
+DECRYPT_COLOR = {
+    "decrypted": "green",
+    "would decrypt": "yellow",
     "skipped": None,
     "error": "red",
 }
@@ -934,7 +924,7 @@ class EncryptCommand(Subcommand):
                 _emit_state(color, width, ENCRYPT_COLOR, "skipped", display)
                 continue
 
-            failure = await _sops_in_place(config, sops, "encrypt", path)
+            failure = await _run_sops(config, sops, "encrypt", path)
             if failure is None:
                 _emit_state(color, width, ENCRYPT_COLOR, "encrypted", display)
                 acted += 1
@@ -972,18 +962,40 @@ class DecryptCommand(Subcommand):
         roots = [_resolve(path, args) for path in args.paths]
         key_files = _resolve_key_files(args)
         env, temporary = _age_key_env(key_files)
-        available = _available_age_keys(key_files, include_env=True)
         try:
-            entries = await _collect_entries(config, roots, sops, args)
-            if not args.dry_run:
-                await _decrypt_entries(config, entries, sops, env, available, args)
-            # The very same view as `status`: `decrypt -n` with no key files *is*
-            # `status`, and a `*name` marks a file one of our keys opened.
-            _print_report(entries, config.key_names, available)
+            matches = [entry async for entry in config.files(roots)]
+
+            color = sys.stdout.isatty()
+            width = max(len(state) for state in DECRYPT_COLOR)
+            acted = errors = 0
+
+            for path, _rule in matches:
+                display = _display(config, path, args)
+                encrypted, error = await filestatus(path, sops)
+                if error is not None or not encrypted:
+                    continue  # unreadable, or already plaintext
+
+                if not args.dry_run and args.interactive and not await _confirm("decrypt", display):
+                    _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
+                    continue
+
+                # Always try, and report verbatim what sops says: this command is a
+                # thin wrapper, not a "smart" filter.
+                failure = await _run_sops(config, sops, "decrypt", path, env, in_place=not args.dry_run)
+                if failure is None:
+                    state = "would decrypt" if args.dry_run else "decrypted"
+                    _emit_state(color, width, DECRYPT_COLOR, state, display)
+                    acted += 1
+                else:
+                    _emit_state(color, width, DECRYPT_COLOR, "error", display, failure)
+                    errors += 1
+
+            if acted == 0 and errors == 0:
+                print("nothing to decrypt")
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        return 0
+        return 1 if errors else 0
 
 
 # --------------------------------------------------------------------------- #
