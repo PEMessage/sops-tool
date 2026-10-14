@@ -127,6 +127,11 @@ no rule, and a binary that `sops filestatus` cannot classify. It also shows
 first-match win ordering between a specific `^secrets/prod\.yaml$` rule and
 broader ones.
 
+The age master keys — the KEKs (key encryption keys) that sops unlocks a file's
+data key with — live in `kek/`. They are regenerated on every `make reset`, and
+are deliberately *not* covered by any creation rule: you do not encrypt a KEK
+with itself.
+
 ## Matching semantics
 
 Identical to sops' own behaviour:

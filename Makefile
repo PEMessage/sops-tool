@@ -33,12 +33,12 @@ help:
 
 $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	@rm -rf $(PLAYGROUND)
-	mkdir -p $(PLAYGROUND)/secrets $(PLAYGROUND)/config $(PLAYGROUND)/app $(PLAYGROUND)/deploy/prod $(PLAYGROUND)/keys $(PLAYGROUND)/data
+	mkdir -p $(PLAYGROUND)/secrets $(PLAYGROUND)/config $(PLAYGROUND)/app $(PLAYGROUND)/deploy/prod $(PLAYGROUND)/kek $(PLAYGROUND)/data
 
-	$(AGE_KEYGEN) -o $(PLAYGROUND)/keys/age.txt >/dev/null
-	$(AGE_KEYGEN) -o $(PLAYGROUND)/keys/age2.txt >/dev/null
-	recipient=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/keys/age.txt)
-	recipient2=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/keys/age2.txt)
+	$(AGE_KEYGEN) -o $(PLAYGROUND)/kek/age.txt >/dev/null
+	$(AGE_KEYGEN) -o $(PLAYGROUND)/kek/age2.txt >/dev/null
+	recipient=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/kek/age.txt)
+	recipient2=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/kek/age2.txt)
 
 	printf '%s\n' \
 		'# Sample config. Rules are tried in order; the first match wins.' \
@@ -111,7 +111,7 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient,$$recipient2" --encrypt --in-place $(PLAYGROUND)/app/extra-key.yaml
 
 	touch $(STAMP)
-	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:     notes.txt' '  filestatus !:    data/blob.bin' '' 'try: make demo'
+	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:     notes.txt' '  kek (keys):      kek/age.txt, kek/age2.txt (sops age keys, not rule-covered)' '  filestatus !:    data/blob.bin' '' 'try: make demo'
 
 playground: $(STAMP)
 
