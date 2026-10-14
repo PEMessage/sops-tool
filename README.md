@@ -65,6 +65,24 @@ $ easy-sops match secrets/prod.yaml
 `status` calls `sops filestatus` for each matched file; a file sops cannot
 classify is reported as an error.
 
+## Playground
+
+The `Makefile` builds a throwaway sandbox under `./playground/` (gitignored) so
+you can try every command without touching real secrets. It needs `sops` and
+`age-keygen`.
+
+```console
+$ make help         # list the playground targets
+$ make playground   # create ./playground/ with sample rules and secrets
+$ make demo         # run every command against it
+$ make clean        # delete it
+```
+
+The sandbox contains four kinds of files on purpose: encrypted ones, plaintext
+ones that are still caught by a rule, a file matched by no rule, and a binary
+that `sops filestatus` cannot classify. It also shows first-match win ordering
+between a specific `^secrets/prod\.yaml$` rule and broader ones.
+
 ## Matching semantics
 
 Identical to sops' own behaviour:
