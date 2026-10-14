@@ -44,7 +44,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -81,8 +81,8 @@ STATE_ROTATE = "need rotate"
 STATE_ERROR = "error"
 
 STATE_COLOR = {
-    STATE_ENCRYPTED: "green",
-    STATE_PLAIN: "yellow",
+    STATE_ENCRYPTED: None,  # no drift -> default (white)
+    STATE_PLAIN: None,
     STATE_UPDATEKEYS: "yellow",
     STATE_ROTATE: "yellow",
     STATE_ERROR: "red",
@@ -369,8 +369,8 @@ def _display(config: Config, path: Path, args: argparse.Namespace) -> str:
     return Path(os.path.relpath(path, base)).as_posix()
 
 
-def _paint(text: str, color: str, enabled: bool) -> str:
-    if not enabled:
+def _paint(text: str, color: str | None, enabled: bool) -> str:
+    if not enabled or color is None:
         return text
     return f"{ANSI[color]}{text}{ANSI['reset']}"
 
@@ -525,10 +525,6 @@ class StatusCommand(Subcommand):
             return 0
 
         _print_status(entries, config.root if args.branch else None)
-
-        for entry in entries:
-            if entry.error is not None:
-                print(f"{entry.path}: {entry.error}", file=sys.stderr)
         return 0
 
 
@@ -576,18 +572,16 @@ def _status_entry(
 
 
 def _key_tokens(entry: StatusEntry, pronouns: Mapping[Key, str]) -> list[tuple[str, str | None]]:
-    """Signed, coloured pronouns: `+` present, `-` expected-but-absent."""
+    """Signed, coloured pronouns: `+` (green) present, `-` (red) expected-but-absent."""
     if entry.unknown:
         return [("?", None)]
     tokens: list[tuple[str, str | None]] = []
     for key in sorted(entry.keys | entry.expected):
         pronoun = pronouns[key]
-        if key in entry.keys and key in entry.expected:
-            tokens.append((f"+{pronoun}", "green"))  # present and expected
-        elif key in entry.keys:
-            tokens.append((f"+{pronoun}", "red"))  # present but not expected
+        if key in entry.keys:
+            tokens.append((f"+{pronoun}", "green"))
         else:
-            tokens.append((f"-{pronoun}", "red"))  # expected but not present
+            tokens.append((f"-{pronoun}", "red"))
     return tokens or [("-", None)]
 
 
@@ -615,7 +609,10 @@ def _print_status(entries: Sequence[StatusEntry], branch_root: Path | None = Non
         if width_keys:
             colored = " ".join(_paint(text, shade, color) if shade else text for text, shade in row)
             line += f"  {colored}{' ' * (width_keys - len(plain))}"
-        print(line.rstrip())
+        line = line.rstrip()
+        if entry.error is not None:
+            line += f"  {entry.error}"
+        print(line)
 
 
 # --------------------------------------------------------------------------- #

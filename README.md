@@ -31,15 +31,14 @@ Commands follow git's porcelain/plumbing split:
 ## Usage
 
 `status` mirrors `git status --short [--branch]`: one line per matched file,
-with a coloured state word, and paths relative to the current directory. Each
-line also names the master key(s), compared against the keys the matching rule
-expects.
+with a state word, and paths relative to the current directory. Each line also
+names the master key(s), compared against the keys the matching rule expects.
 
 sops keys have no human name, so each distinct key gets a short **pronoun** of
 the form `<backend>~<index>`, and the pronouns are defined at the top of the
-output. Keys are signed: `+` is a key the file currently has, `-` one the rule
-expects but the file lacks. Green means the key is present *and* expected; red
-means it needs attention (extra or missing):
+output. Keys are signed and coloured: `+` (green) is a key the file currently
+has, `-` (red) is a key the rule expects but the file lacks. Files with no drift
+are left uncoloured (white); only drifting or failing files get a colour:
 
 ```console
 $ easy-sops status --branch
@@ -51,7 +50,7 @@ encrypted        secrets/dev.yaml     +age~0 +age~1
 not encrypted    secrets/extra.yaml   -age~0 -age~1
 need updatekeys  secrets/drift.yaml   +age~0 -age~1
 need rotate      app/rotate.yaml      -age~0 +age~1
-error            data/blob.bin        ?
+error            data/blob.bin        ?  <sops filestatus message>
 ```
 
 The state words are named after the sops command that would fix the file:
@@ -62,7 +61,11 @@ The state words are named after the sops command that would fix the file:
   (`sops updatekeys`);
 - **need rotate** — the file has keys the rule no longer expects
   (`sops rotate`);
-- **error** — `sops filestatus` could not classify the file.
+- **error** — `sops filestatus` could not classify the file; the message is
+  appended to that file's own line, so it never disturbs the others.
+
+`need updatekeys` and `need rotate` are highlighted; `error` is red. Files with
+no drift stay white.
 
 Add `--branch` for the `##` header. Paths are printed relative to the current
 directory by default; pass `--full-name` for repository-root-relative paths.
