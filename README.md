@@ -14,9 +14,22 @@ The config is loaded once into an in-memory `Config` object. Each command is a
 self-contained `Subcommand` class: it defines its own arguments and its own
 `run`, and registers itself with the `@subcommand` decorator — there is no
 central command table and no single place that knows every flag. Blocking work
-(directory walks, YAML parsing) runs on threads via `asyncio.to_thread`, and
-`sops` is driven as a real async subprocess, so `status` fans its
-`sops filestatus` calls out concurrently.
+(directory walks, YAML parsing, age-key derivation) runs on threads via
+`asyncio.to_thread`, and `sops` is driven as a real async subprocess, so `status`
+fans its `sops filestatus` calls out concurrently.
+
+Commands share one small vocabulary, so each edge case is handled in exactly one
+place:
+
+- **`Key`** — a normalised master key, `(backend, identifier)`;
+- **`State`** — a labelled outcome with its colour and porcelain code;
+- **`Inspection`** — the single answer to "what is this file?": a `State`, the
+  keys it is encrypted to (`None` when unknown), and an error message.
+
+`sops` is only ever invoked through the `Sops` driver, and only `Reporter`
+prints. `encrypt` and `decrypt` share one loop (`ActionCommand`): inspect,
+classify, then skip, report, ask, or mutate — so "a file I cannot read is an
+`error`", say, is decided once and holds for every command.
 
 Commands follow git's porcelain/plumbing split:
 
@@ -143,10 +156,10 @@ touching anything:
 
 ```console
 $ sops-tool encrypt --dry-run -- secrets
-would encrypt  secrets/extra.yaml
+would encrypt    secrets/extra.yaml
 
 $ sops-tool encrypt -- secrets
-encrypted      secrets/extra.yaml
+encrypted        secrets/extra.yaml
 ```
 
 Use `-i/--interactive` to confirm each file one at a time:
@@ -154,24 +167,25 @@ Use `-i/--interactive` to confirm each file one at a time:
 ```console
 $ sops-tool encrypt -i
 encrypt secrets/extra.yaml? [y/N] y
-encrypted      secrets/extra.yaml
+encrypted        secrets/extra.yaml
 ```
 
 `decrypt` is a thin wrapper over `sops --decrypt`: for every matched file that is
 encrypted it *always* tries to decrypt, and reports whatever sops says —
-`decrypted`, `would decrypt` (dry-run), or `error <message>`. There is no
-"smart" filtering; a missing key is simply an error:
+`decrypted`, `would decrypt` (dry-run, which really probes sops read-only), or
+`error <message>`. There is no "smart" filtering; a missing key is simply an
+error:
 
 ```console
-$ sops-tool decrypt -n
-error          secrets/dev.yaml          but none were.
-error          secrets/missing-key.yaml  but none were.
-error          secrets/prod.yaml         but none were.
+$ sops-tool decrypt -n -- secrets
+error            secrets/dev.yaml  but none were.
+error            secrets/missing-key.yaml  but none were.
+error            secrets/prod.yaml  but none were.
 
-$ SOPS_AGE_KEY_FILE=keys/age.txt sops-tool decrypt
-decrypted      secrets/dev.yaml
-decrypted      secrets/missing-key.yaml
-decrypted      secrets/prod.yaml
+$ SOPS_AGE_KEY_FILE=keys/age.txt sops-tool decrypt -- secrets
+decrypted        secrets/dev.yaml
+decrypted        secrets/missing-key.yaml
+decrypted        secrets/prod.yaml
 ```
 
 It takes the same `--` path filter and `-n/--dry-run` / `-i/--interactive`

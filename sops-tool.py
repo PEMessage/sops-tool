@@ -12,8 +12,18 @@ relative path arguments) in `DIR`, just like `git -C`.
 The `.sops.yaml` is loaded once into an in-memory `Config` object. Commands are
 self-contained `Subcommand` classes: each defines its own arguments and its own
 `run`, and registers itself with the `@subcommand` decorator. Blocking work
-(directory walks, YAML parsing) runs on threads, while `sops` is driven as a
-real async subprocess.
+(directory walks, YAML parsing, age-key derivation) runs on threads, while `sops`
+is driven as a real async subprocess.
+
+The vocabulary every command shares:
+
+* `Key`     — one master key, `(backend, identifier)`, normalised for comparison;
+* `State`   — a labelled outcome, with its colour and porcelain code;
+* `Inspection` — the single, uniform answer to "what is this file?": a `State`,
+  the keys it is encrypted to (`None` when unknown), and an error message.
+
+`sops` is only ever spoken to through the `Sops` driver, so the filestatus/decrypt
+semantics live in exactly one place, and `Reporter` is the only thing that prints.
 
 plumbing
   root       print the repository root
@@ -27,9 +37,9 @@ porcelain
   decrypt    decrypt matched files in place (a thin `sops` wrapper)
 
 `status` reports every matched file, its keys and its encryption state. With
-`--decrypt-check` it also runs `sops --decrypt` on each encrypted file and marks
-the ones that open with an orange `*` (naming the matching keys where it can).
-`decrypt` does not share that view: it is a thin wrapper that simply runs
+`--decrypt-check` (`-d`) it also runs `sops --decrypt` on each encrypted file and
+marks the ones that open with an orange `*`, naming the matching keys where it
+can. `decrypt` does not share that view: it is a thin wrapper that simply runs
 `sops --decrypt` on the matched files and reports what sops says.
 
 Commands accept `--` before paths, like git: `sops-tool status -- secrets/`.
@@ -50,15 +60,18 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
 MAX_CONCURRENCY = 8
+
+# sops backends we understand, and where each stores its identifier in a file's
+# `sops:` metadata block.
 BACKENDS = (
     "age",
     "pgp",
@@ -68,11 +81,6 @@ BACKENDS = (
     "azure_keyvault",
     "hc_vault_transit_uri",
 )
-
-# A master key is identified by (backend, normalized identifier).
-Key = tuple[str, str]
-
-# Where each backend stores its identifier in a file's `sops:` metadata block.
 META_FIELD = {
     "age": "recipient",
     "pgp": "fp",
@@ -83,32 +91,6 @@ META_FIELD = {
     "hc_vault_transit_uri": "uri",
 }
 
-# File states, named after the sops command that would fix them.
-STATE_ENCRYPTED = "encrypted"
-STATE_PLAIN = "not encrypted"
-STATE_UPDATEKEYS = "need updatekeys"
-STATE_ROTATE = "need rotate"
-STATE_ERROR = "error"
-STATE_DECRYPTED = "decrypted"
-
-STATE_COLOR = {
-    STATE_ENCRYPTED: "green",  # no drift
-    STATE_PLAIN: None,  # no encryption -> default (white)
-    STATE_UPDATEKEYS: "yellow",  # pure-plus drift: encryption has an extra key
-    STATE_ROTATE: "yellow",  # minus drift: an expected key is missing
-    STATE_ERROR: "red",
-    STATE_DECRYPTED: "green",
-}
-PORCELAIN_CODE = {
-    STATE_ENCRYPTED: "E",
-    STATE_PLAIN: "U",
-    STATE_UPDATEKEYS: "+",
-    STATE_ROTATE: "-",
-    STATE_ERROR: "!",
-    STATE_DECRYPTED: "D",
-}
-LABEL_WIDTH = max(len(state) for state in STATE_COLOR)
-
 ANSI = {
     "reset": "\033[0m",
     "red": "\033[31m",
@@ -118,12 +100,174 @@ ANSI = {
 }
 
 
-class ConfigError(Exception):
-    """Raised when no `.sops.yaml` can be found or it cannot be parsed."""
+# --------------------------------------------------------------------------- #
+# errors
+# --------------------------------------------------------------------------- #
+class ToolError(Exception):
+    """A user-facing failure; `code` is the process exit status."""
+
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ConfigError(ToolError):
+    """The repository could not be found, read or parsed."""
 
 
 # --------------------------------------------------------------------------- #
-# plumbing: the repository object
+# vocabulary: keys, states, and the result of examining a file
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True, order=True)
+class Key:
+    """One master key: a backend plus its normalised identifier."""
+
+    backend: str
+    identifier: str
+
+    @classmethod
+    def of(cls, backend: str, value: str) -> "Key":
+        return cls(backend, _normalize_key(backend, value))
+
+    @property
+    def text(self) -> str:
+        return self.identifier
+
+
+@dataclass(frozen=True)
+class State:
+    """A labelled outcome: how it reads, how it is coloured, its porcelain code."""
+
+    label: str
+    color: str | None = None
+    code: str = ""
+
+
+# Inspection states (what a file *is*) and action states (what a command *did*).
+ENCRYPTED = State("encrypted", "green", "E")
+PLAIN = State("not encrypted", None, "U")
+UPDATEKEYS = State("need updatekeys", "yellow", "+")
+ROTATE = State("need rotate", "yellow", "-")
+ERROR = State("error", "red", "!")
+DECRYPTED = State("decrypted", "green", "D")
+WOULD_ENCRYPT = State("would encrypt", "yellow")
+WOULD_DECRYPT = State("would decrypt", "yellow")
+SKIPPED = State("skipped", None)
+
+# A file in one of these states has encrypted keys we might be able to open.
+ENCRYPTED_STATES = (ENCRYPTED, UPDATEKEYS, ROTATE)
+
+# Every state shares one label width, so status and the action commands align.
+LABEL_WIDTH = max(len(state.label) for state in
+                  (ENCRYPTED, PLAIN, UPDATEKEYS, ROTATE, ERROR, DECRYPTED,
+                   WOULD_ENCRYPT, WOULD_DECRYPT, SKIPPED))
+
+
+@dataclass(frozen=True)
+class Inspection:
+    """What one pass of `sops filestatus` (plus metadata) tells us about a file."""
+
+    state: State
+    keys: frozenset[Key] | None  # None when the keys cannot be introspected
+    error: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# master keys
+# --------------------------------------------------------------------------- #
+def _normalize_key(backend: str, value: str) -> str:
+    value = value.strip()
+    if backend == "age":
+        return value.lower()
+    if backend == "pgp":
+        return value.replace(" ", "").upper()
+    return value
+
+
+def _as_list(value: Any) -> list[str]:
+    """sops accepts either a comma-separated string or a list for key fields."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _iter_rule_keys(fields: Mapping[str, Any]) -> Iterator[tuple[str, str]]:
+    """Yield `(backend, raw_value)` for every key a rule references."""
+    for backend in BACKENDS:
+        for raw in _as_list(fields.get(backend)):
+            yield backend, raw
+    for group in fields.get("key_groups") or []:
+        if isinstance(group, Mapping):
+            yield from _iter_rule_keys(group)
+
+
+def _keys_from_fields(fields: Mapping[str, Any]) -> set[Key]:
+    """The master keys a creation rule expects (top-level fields + key_groups)."""
+    keys: set[Key] = set()
+    for backend, raw in _iter_rule_keys(fields):
+        keys.add(Key.of(backend, raw))
+    return keys
+
+
+def _actual_keys(path: Path) -> set[Key] | None:
+    """Master keys a file is actually encrypted to, from its plaintext metadata.
+
+    The format is detected from the content, not the extension, so a sops file
+    stored as JSON under an arbitrary name still resolves. Returns ``None`` when
+    the file cannot be introspected (e.g. the binary store).
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    # The file may be JSON (sops' fallback for unknown extensions, and it uses
+    # tab indentation, which YAML rejects), or YAML. Try JSON first.
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return None
+    if not isinstance(data, Mapping):
+        return None
+    block = data.get("sops")
+    if not isinstance(block, Mapping):
+        return None
+
+    keys: set[Key] = set()
+    for backend in BACKENDS:
+        entries = block.get(backend)
+        if entries is None:
+            continue
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if isinstance(entry, Mapping):
+                value = entry.get(META_FIELD[backend])
+                if value is None:
+                    continue
+            else:
+                value = entry
+            keys.add(Key.of(backend, str(value)))
+    return keys
+
+
+def _pronouns(keys: Iterable[Key]) -> dict[Key, str]:
+    """Assign unnamed keys a `backend~index` pronoun, numbered per backend."""
+    counters: dict[str, int] = {}
+    result: dict[Key, str] = {}
+    for key in sorted(set(keys)):
+        index = counters.get(key.backend, 0)
+        counters[key.backend] = index + 1
+        result[key] = f"{key.backend}~{index}"
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# repository: the parsed .sops.yaml and its creation rules
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Rule:
@@ -142,14 +286,14 @@ class Rule:
     def name(self) -> str:
         return f"#{self.index}"
 
-    def backends(self) -> tuple[str, ...]:
-        found = [name for name in BACKENDS if self.fields.get(name)]
+    def sources(self) -> tuple[str, ...]:
+        """The key sources the rule configures, for `ls-rules`."""
+        found = [backend for backend in BACKENDS if self.fields.get(backend)]
         if self.fields.get("key_groups"):
             found.append("key_groups")
         return tuple(found)
 
     def keys(self) -> set[Key]:
-        """The master keys this rule expects a file to be encrypted to."""
         return _keys_from_fields(self.fields)
 
 
@@ -202,11 +346,9 @@ class Config:
     def rule_for(self, path: Path) -> Rule | None:
         return self.match(self.relative(Path(path).resolve()))
 
-    async def files(self, roots: Sequence[Path] = ()) -> AsyncIterator[tuple[Path, Rule]]:
-        """Yield `(path, rule)` for every file caught by a rule."""
-        matched = await asyncio.to_thread(_matched_files, self, tuple(roots))
-        for item in matched:
-            yield item
+    async def files(self, roots: Sequence[Path] = ()) -> list[tuple[Path, Rule]]:
+        """Every `(path, rule)` caught by a rule under *roots* (default: root)."""
+        return await asyncio.to_thread(_matched_files, self, tuple(roots))
 
 
 def _find_config(directory: Path) -> Path | None:
@@ -259,23 +401,13 @@ def _raw_key_names(text: str, data: Mapping[str, Any]) -> dict[str, str]:
     return names
 
 
-def _iter_rule_keys(fields: Mapping[str, Any]) -> Iterator[tuple[str, str]]:
-    """Yield `(backend, raw_value)` for every key a rule references."""
-    for backend in BACKENDS:
-        for raw in _as_list(fields.get(backend)):
-            yield backend, raw
-    for group in fields.get("key_groups") or []:
-        if isinstance(group, Mapping):
-            yield from _iter_rule_keys(group)
-
-
 def _rule_key_names(rules: Sequence[Rule], raw_names: Mapping[str, str]) -> dict[Key, str]:
     names: dict[Key, str] = {}
     for rule in rules:
         for backend, raw in _iter_rule_keys(rule.fields):
             name = raw_names.get(raw)
             if name:
-                names.setdefault((backend, _normalize_key(backend, raw)), name)
+                names.setdefault(Key.of(backend, raw), name)
     return names
 
 
@@ -321,29 +453,88 @@ def _walk(root: Path) -> Iterator[Path]:
             yield Path(dirpath) / name
 
 
-async def filestatus(path: Path, sops: str) -> tuple[bool | None, str | None]:
-    """Thin wrapper around `sops filestatus`: returns `(encrypted, error)`."""
-    proc = await asyncio.create_subprocess_exec(
-        sops,
-        "filestatus",
-        str(path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        return None, _clean_error(stderr.decode(errors="replace"))
-    text = stdout.decode(errors="replace")
-    try:
-        return bool(json.loads(text).get("encrypted")), None
-    except (ValueError, AttributeError):
-        return None, f"unexpected filestatus output: {text.strip()!r}"
+# --------------------------------------------------------------------------- #
+# the sops driver: the one place that speaks to sops
+# --------------------------------------------------------------------------- #
+class Sops:
+    """A handle on the `sops` binary. Every call goes through here."""
+
+    def __init__(self, binary: str) -> None:
+        self.binary = binary
+
+    @classmethod
+    def require(cls) -> "Sops":
+        binary = shutil.which("sops")
+        if binary is None:
+            raise ToolError("sops not found in PATH", 127)
+        return cls(binary)
+
+    async def _run(
+        self, arguments: Sequence[str], env: Mapping[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *arguments,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_child_env(env),
+        )
+        stdout, stderr = await proc.communicate()
+        return (
+            proc.returncode,
+            stdout.decode(errors="replace"),
+            stderr.decode(errors="replace"),
+        )
+
+    async def inspect(self, path: Path) -> Inspection:
+        """Ask sops what a file is, and read its master keys if encrypted."""
+        code, stdout, stderr = await self._run([self.binary, "filestatus", str(path)])
+        if code != 0:
+            message = _clean_error(stderr)
+            if _is_read_error(message):
+                return Inspection(ERROR, None, message)
+            # Anything else means "not a sops document": report it as plaintext.
+            return Inspection(PLAIN, frozenset())
+        try:
+            encrypted = bool(json.loads(stdout).get("encrypted"))
+        except (ValueError, AttributeError):
+            return Inspection(PLAIN, frozenset())
+        if not encrypted:
+            return Inspection(PLAIN, frozenset())
+        keys = await asyncio.to_thread(_actual_keys, path)
+        return Inspection(ENCRYPTED, None if keys is None else frozenset(keys))
+
+    async def change(
+        self,
+        config: Config,
+        action: str,
+        path: Path,
+        env: Mapping[str, str] | None = None,
+        in_place: bool = True,
+    ) -> str | None:
+        """Run `sops --config … --<action> [--in-place] <path>`; return its error."""
+        command = [self.binary, "--config", str(config.path), f"--{action}"]
+        if in_place:
+            command.append("--in-place")
+        command.append(str(path))
+        code, _stdout, stderr = await self._run(command, env)
+        return None if code == 0 else _clean_error(stderr)
+
+
+async def inspect_all(sops: Sops, paths: Sequence[Path]) -> list[Inspection]:
+    """Inspect many files concurrently, preserving order."""
+    limit = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def one(path: Path) -> Inspection:
+        async with limit:
+            return await sops.inspect(path)
+
+    return list(await asyncio.gather(*(one(path) for path in paths)))
 
 
 def _clean_error(stderr: str) -> str:
     lines = [line for line in stderr.strip().splitlines() if line.strip()]
     if not lines:
-        return "sops filestatus failed"
+        return "sops failed"
     match = re.search(r'msg="(.*)"\s*$', lines[-1])
     if not match:
         return lines[-1]
@@ -356,29 +547,16 @@ def _is_read_error(message: str) -> bool:
     return "error reading file" in lowered or "permission denied" in lowered
 
 
-async def _run_sops(
-    config: "Config",
-    sops: str,
-    action: str,
-    path: Path,
-    env: Mapping[str, str] | None = None,
-    in_place: bool = True,
-) -> str | None:
-    """Run `sops --config … --<action> [--in-place] <path>`. Returns an error."""
-    command = [sops, "--config", str(config.path), f"--{action}"]
-    if in_place:
-        command.append("--in-place")
-    command.append(str(path))
-    proc = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_child_env(env),
-    )
-    _stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        return _clean_error(stderr.decode(errors="replace"))
-    return None
+# --------------------------------------------------------------------------- #
+# age identities we can see (best effort, for naming keys in status -d)
+# --------------------------------------------------------------------------- #
+AGE_KEY_ENV = "SOPS_AGE_KEY"
+AGE_KEY_FILE_ENV = "SOPS_AGE_KEY_FILE"
+AGE_KEY_CMD_ENV = "SOPS_AGE_KEY_CMD"
+
+
+def _child_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
+    return {**os.environ, **env} if env else None
 
 
 def _age_key_env(paths: Sequence[Path]) -> tuple[dict[str, str] | None, Path | None]:
@@ -399,16 +577,7 @@ def _age_key_env(paths: Sequence[Path]) -> tuple[dict[str, str] | None, Path | N
     return {"SOPS_AGE_KEY_FILE": str(temporary)}, temporary
 
 
-def _child_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
-    return {**os.environ, **env} if env else None
-
-
-AGE_KEY_ENV = "SOPS_AGE_KEY"
-AGE_KEY_FILE_ENV = "SOPS_AGE_KEY_FILE"
-AGE_KEY_CMD_ENV = "SOPS_AGE_KEY_CMD"
-
-
-def _identity_texts(paths: Sequence[Path], include_env: bool) -> list[str]:
+def _identity_texts(key_files: Sequence[Path], include_env: bool) -> list[str]:
     """Age identity *material* from our key files and the `SOPS_AGE_KEY*` env.
 
     sops reads identities from many places; we mirror the ones that are plain
@@ -425,8 +594,8 @@ def _identity_texts(paths: Sequence[Path], include_env: bool) -> list[str]:
         except OSError:
             pass
 
-    for path in paths:
-        read(path)
+    for key_file in key_files:
+        read(key_file)
     if include_env:
         env_file = os.environ.get(AGE_KEY_FILE_ENV)
         if env_file:
@@ -441,14 +610,17 @@ def _identity_texts(paths: Sequence[Path], include_env: bool) -> list[str]:
 
 
 def _run_key_command(command: str) -> str:
+    """Run `SOPS_AGE_KEY_CMD` for its identity output; empty on any failure."""
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=10
+        )
     except (OSError, subprocess.SubprocessError):
         return ""
     return result.stdout if result.returncode == 0 else ""
 
 
-def _age_recipients(texts: Iterable[str]) -> set[str]:
+def _derive_recipients(texts: Iterable[str]) -> set[str]:
     """The age public keys hiding in identity material, however we can find them.
 
     `age-keygen -y` derives them properly from *any* identity (private key or
@@ -472,111 +644,28 @@ def _age_recipients(texts: Iterable[str]) -> set[str]:
     return set(re.findall(r"#\s*public key:\s*(age1[0-9a-z]+)", blob))
 
 
-def _available_age_keys(key_files: Sequence[Path], include_env: bool = False) -> set[Key]:
-    texts = _identity_texts(key_files, include_env)
-    return {("age", recipient) for recipient in _age_recipients(texts)}
+async def available_age_keys(
+    key_files: Sequence[Path], include_env: bool = False
+) -> set[Key]:
+    """The age keys we could decrypt with, derived off the event loop."""
+    texts = await asyncio.to_thread(_identity_texts, key_files, include_env)
+    recipients = await asyncio.to_thread(_derive_recipients, texts)
+    return {Key("age", recipient) for recipient in recipients}
 
 
 # --------------------------------------------------------------------------- #
-# master keys
+# paths: how arguments are resolved and how paths are shown
 # --------------------------------------------------------------------------- #
-def _normalize_key(backend: str, value: str) -> str:
-    value = value.strip()
-    if backend == "age":
-        return value.lower()
-    if backend == "pgp":
-        return value.replace(" ", "").upper()
-    return value
-
-
-def _as_list(value: Any) -> list[str]:
-    """sops accepts either a comma-separated string or a list for key fields."""
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value]
-    return [str(value)]
-
-
-def _keys_from_fields(fields: Mapping[str, Any]) -> set[Key]:
-    """The master keys a creation rule expects (top-level fields + key_groups)."""
-    keys: set[Key] = set()
-    for backend in BACKENDS:
-        for value in _as_list(fields.get(backend)):
-            keys.add((backend, _normalize_key(backend, value)))
-    for group in fields.get("key_groups") or []:
-        if isinstance(group, Mapping):
-            keys |= _keys_from_fields(group)
-    return keys
-
-
-def _actual_keys(path: Path) -> set[Key] | None:
-    """Master keys a file is actually encrypted to, from its plaintext metadata.
-
-    The format is detected from the content, not the extension, so a sops file
-    stored as JSON under an arbitrary name still resolves. Returns ``None`` when
-    the file cannot be introspected (e.g. the binary store).
-    """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
-    # The file may be JSON (sops' fallback for unknown extensions, and it uses
-    # tab indentation, which YAML rejects), or YAML. Try JSON first.
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        try:
-            data = yaml.safe_load(text)
-        except yaml.YAMLError:
-            return None
-    if not isinstance(data, Mapping):
-        return None
-    block = data.get("sops")
-    if not isinstance(block, Mapping):
-        return None
-
-    keys: set[Key] = set()
-    for backend in BACKENDS:
-        entries = block.get(backend)
-        if entries is None:
-            continue
-        for entry in entries if isinstance(entries, list) else [entries]:
-            if isinstance(entry, Mapping):
-                value = entry.get(META_FIELD[backend])
-                if value is None:
-                    continue
-            else:
-                value = entry
-            keys.add((backend, _normalize_key(backend, str(value))))
-    return keys
-
-
-def _pronouns(keys: Iterable[Key]) -> dict[Key, str]:
-    """Assign unnamed keys a `backend~index` pronoun, numbered per backend."""
-    counters: dict[str, int] = {}
-    result: dict[Key, str] = {}
-    for backend, identifier in sorted(set(keys)):
-        index = counters.get(backend, 0)
-        counters[backend] = index + 1
-        result[(backend, identifier)] = f"{backend}~{index}"
-    return result
-
-
-# --------------------------------------------------------------------------- #
-# path helpers
-# --------------------------------------------------------------------------- #
-def _base(args: argparse.Namespace) -> Path:
-    """Directory that relative paths are interpreted and displayed against."""
-    return Path(args.directory).expanduser().resolve() if args.directory else Path.cwd()
+def _invocation_dir(args: argparse.Namespace) -> Path:
+    """Directory relative paths are interpreted and displayed against."""
+    directory = getattr(args, "directory", None)
+    return Path(directory).expanduser().resolve() if directory else Path.cwd()
 
 
 def _resolve(raw: str, args: argparse.Namespace) -> Path:
     path = Path(raw).expanduser()
-    if not path.is_absolute() and args.directory:
-        path = Path(args.directory) / path
+    if not path.is_absolute():
+        path = _invocation_dir(args) / path
     return path.resolve()
 
 
@@ -589,18 +678,161 @@ def _resolve_key_files(args: argparse.Namespace) -> list[Path]:
 
 
 def _display(config: Config, path: Path, args: argparse.Namespace) -> str:
-    base = config.root if getattr(args, "full_name", False) else _base(args)
+    base = config.root if args.full_name else _invocation_dir(args)
     return Path(os.path.relpath(path, base)).as_posix()
 
 
-def _paint(text: str, color: str | None, enabled: bool) -> str:
-    if not enabled or color is None:
-        return text
-    return f"{ANSI[color]}{text}{ANSI['reset']}"
+# --------------------------------------------------------------------------- #
+# reporting: the one thing that prints
+# --------------------------------------------------------------------------- #
+class Reporter:
+    """Renders states and the `status` report consistently."""
+
+    def __init__(self, color: bool | None = None) -> None:
+        self.color = sys.stdout.isatty() if color is None else color
+
+    def paint(self, text: str, color: str | None) -> str:
+        if not self.color or color is None:
+            return text
+        return f"{ANSI[color]}{text}{ANSI['reset']}"
+
+    def outcome(self, state: State, path: str, detail: str | None = None) -> None:
+        """One action-command line: `<state>  <path>  [detail]`."""
+        label = self.paint(state.label.ljust(LABEL_WIDTH), state.color)
+        print(f"{label}  {path}" + (f"  {detail}" if detail else ""))
+
+    def status(
+        self,
+        rows: Sequence["Row"],
+        key_names: Mapping[Key, str],
+        available: frozenset[Key] = frozenset(),
+        decryptable: frozenset[Path] = frozenset(),
+        branch_root: Path | None = None,
+    ) -> None:
+        all_keys = set(available)
+        for row in rows:
+            all_keys |= row.expected
+            if row.keys is not None:
+                all_keys |= row.keys
+        labels = _labels(all_keys, key_names)
+
+        # A legend of every key in play; the ones we can decrypt with go orange.
+        if labels:
+            for key in sorted(all_keys, key=lambda k: labels[k]):
+                shade = "orange" if key in available else None
+                print(self.paint(f"{labels[key]}: {key.text}", shade))
+            print()
+
+        if branch_root is not None:
+            print(f"## {branch_root}")
+
+        # For each row: the key-diff tokens, the keys we can name that open it,
+        # and whether sops opened it through some other (unnameable) source.
+        entries = [
+            (
+                _key_diff(row, labels),
+                _open_keys(row, labels, available, decryptable),
+            )
+            for row in rows
+        ]
+        plain_keys = [" ".join(text for text, _shade in diff) for diff, _ in entries]
+        plain_marks = [
+            " ".join(f"*{name}" for name in names) if names else ("*" if opened else "")
+            for _diff, (names, opened) in entries
+        ]
+
+        width_path = max((len(row.path) for row in rows), default=0)
+        width_keys = max((len(text) for text in plain_keys if text != "-"), default=0)
+        width_marks = max((len(text) for text in plain_marks), default=0)
+
+        for row, (diff, (names, _opened)), keys_text, plain_mark in zip(
+            rows, entries, plain_keys, plain_marks
+        ):
+            label = self.paint(row.state.label.ljust(LABEL_WIDTH), row.state.color)
+            line = f"{label}  {row.path.ljust(width_path)}"
+            if width_keys:
+                colored = " ".join(
+                    self.paint(text, shade) if shade else text for text, shade in diff
+                )
+                line += f"  {colored}{' ' * (width_keys - len(keys_text))}"
+            if width_marks:
+                if names:
+                    mark = " ".join(self.paint(f"*{name}", "orange") for name in names)
+                elif plain_mark:
+                    mark = self.paint("*", "orange")
+                else:
+                    mark = ""
+                line += f"  {mark}{' ' * (width_marks - len(plain_mark))}"
+            line = line.rstrip()
+            if row.error is not None:
+                line += f"  {row.error}"
+            print(line)
 
 
-def _paint_tokens(tokens: Sequence[tuple[str, str | None]], enabled: bool) -> str:
-    return " ".join(_paint(text, shade, enabled) if shade else text for text, shade in tokens)
+def _labels(keys: Iterable[Key], key_names: Mapping[Key, str]) -> dict[Key, str]:
+    pronouns = _pronouns(keys)
+    return {key: key_names.get(key) or pronouns[key] for key in pronouns}
+
+
+def _key_diff(row: "Row", labels: Mapping[Key, str]) -> list[tuple[str, str | None]]:
+    """The file's keys vs the rule's: white same, green `+` missing, red `-` extra."""
+    if row.keys is None:
+        return [("?", None)]
+    keys, expected = row.keys, row.expected
+    tokens: list[tuple[str, str | None]] = []
+    for key in sorted(keys | expected, key=lambda key: labels[key]):
+        label = labels[key]
+        if key in keys and key in expected:
+            tokens.append((label, None))  # matches .sops.yaml -> white
+        elif key in expected:
+            tokens.append((f"+{label}", "green"))  # rule has it, file lacks it
+        else:
+            tokens.append((f"-{label}", "red"))  # file has it, rule lacks it
+    return tokens or [("-", None)]
+
+
+def _open_keys(
+    row: "Row",
+    labels: Mapping[Key, str],
+    available: frozenset[Key],
+    decryptable: frozenset[Path],
+) -> tuple[tuple[str, ...], bool]:
+    """The named keys that open this file, plus whether sops opened it at all."""
+    names = tuple(
+        labels[key]
+        for key in sorted(row.keys or (), key=lambda key: labels[key])
+        if key in available
+    )
+    return names, row.source in decryptable
+
+
+@dataclass(frozen=True)
+class Row:
+    """One line of the status report: a file, its state, and its key diff."""
+
+    source: Path
+    path: str
+    state: State
+    expected: frozenset[Key]
+    keys: frozenset[Key] | None  # None = unknown
+    error: str | None = None
+
+
+def _status_row(config: Config, path: Path, rule: Rule, inspection: Inspection,
+                args: argparse.Namespace) -> Row:
+    expected = frozenset(rule.keys())
+    display = _display(config, path, args)
+    if inspection.state is ERROR:
+        return Row(path, display, ERROR, expected, None, inspection.error)
+    if inspection.state is PLAIN:
+        # Not a sops document: it carries none of the rule's keys.
+        return Row(path, display, PLAIN, expected, frozenset())
+    if inspection.keys is None:
+        return Row(path, display, ENCRYPTED, expected, None)
+    extra = inspection.keys - expected
+    missing = expected - inspection.keys
+    state = ROTATE if extra else UPDATEKEYS if missing else ENCRYPTED
+    return Row(path, display, state, expected, inspection.keys)
 
 
 # --------------------------------------------------------------------------- #
@@ -629,9 +861,141 @@ def subcommand(cls: type[Subcommand]) -> type[Subcommand]:
     return cls
 
 
-def path_argument(parser: argparse.ArgumentParser, help: str) -> None:
+def _add_paths(parser: argparse.ArgumentParser, help: str) -> None:
     """Add the common trailing PATH argument (usable after `--`, like git)."""
     parser.add_argument("paths", nargs="*", metavar="PATH", help=help)
+
+
+def _add_full_name(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--full-name",
+        action="store_true",
+        help="show paths relative to the repository root",
+    )
+
+
+def _add_age_key_file(parser: argparse.ArgumentParser, help: str) -> None:
+    parser.add_argument(
+        "--age-key-file",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help=help,
+    )
+
+
+class FileCommand(Subcommand):
+    """A command that walks the files caught by a creation rule."""
+
+    paths_help = "limit these paths"
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        super().configure(parser)
+        _add_paths(parser, self.paths_help)
+        _add_full_name(parser)
+
+    def roots(self, args: argparse.Namespace) -> list[Path]:
+        return [_resolve(raw, args) for raw in args.paths]
+
+
+class ActionCommand(FileCommand):
+    """A command that inspects each matched file and may change it in place.
+
+    The `encrypt`/`decrypt` loop lives here once: inspect, classify, then either
+    skip, report (dry-run), ask (interactive), or mutate. Subclasses only say
+    which state they act on and how.
+
+    `probe_dry_run` says whether `--dry-run` should *ask sops* (read-only) — true
+    for `decrypt`, where only sops can say whether a key is at hand — or merely
+    predict (false for `encrypt`, where a matching rule is enough).
+    """
+
+    verb: str
+    would: State
+    done: State
+    probe_dry_run = False
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        super().configure(parser)
+        parser.add_argument(
+            "-n", "--dry-run", action="store_true",
+            help=f"only show what would be {self.verb}ed",
+        )
+        parser.add_argument(
+            "-i", "--interactive", action="store_true",
+            help=f"confirm each file before {self.verb}ing",
+        )
+
+    def target(self, state: State) -> bool:
+        """Whether this command acts on a file in *state*."""
+        raise NotImplementedError
+
+    def identity_environment(
+        self, args: argparse.Namespace
+    ) -> tuple[dict[str, str] | None, Path | None]:
+        """Extra environment (and a temp file to clean up) for the sops call."""
+        return None, None
+
+    async def mutate(
+        self,
+        sops: Sops,
+        config: Config,
+        path: Path,
+        env: Mapping[str, str] | None,
+        in_place: bool,
+    ) -> str | None:
+        """Perform the change; return an error message, or None on success."""
+        raise NotImplementedError
+
+    async def run(self, config: Config, args: argparse.Namespace) -> int:
+        sops = Sops.require()
+        env, temporary = self.identity_environment(args)
+        reporter = Reporter()
+        acted = errors = 0
+        try:
+            for path, _rule in await config.files(self.roots(args)):
+                display = _display(config, path, args)
+                inspection = await sops.inspect(path)
+
+                if inspection.state is ERROR:
+                    reporter.outcome(ERROR, display, inspection.error)
+                    errors += 1
+                    continue
+                if not self.target(inspection.state):
+                    continue
+                if args.dry_run and not self.probe_dry_run:
+                    reporter.outcome(self.would, display)
+                    acted += 1
+                    continue
+                if not args.dry_run and args.interactive and not await _confirm(
+                    self.verb, display
+                ):
+                    reporter.outcome(SKIPPED, display)
+                    continue
+
+                # On a probing dry-run this is a read-only call; otherwise it
+                # really changes the file.
+                failure = await self.mutate(
+                    sops, config, path, env, in_place=not args.dry_run
+                )
+                if failure is None:
+                    reporter.outcome(self.would if args.dry_run else self.done, display)
+                    acted += 1
+                else:
+                    reporter.outcome(ERROR, display, failure)
+                    errors += 1
+
+            if not acted and not errors:
+                print(f"nothing to {self.verb}")
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return 1 if errors else 0
+
+
+async def _confirm(verb: str, display: str) -> bool:
+    answer = await asyncio.to_thread(input, f"{verb} {display}? [y/N] ")
+    return answer.strip().lower() in {"y", "yes"}
 
 
 # --------------------------------------------------------------------------- #
@@ -654,29 +1018,19 @@ class LsRulesCommand(Subcommand):
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
         for rule in config.rules:
-            pattern = rule.path_regex or "*"
-            backends = ",".join(rule.backends()) or "-"
-            print(f"{rule.name}\t{pattern}\t{backends}")
+            backends = ",".join(rule.sources()) or "-"
+            print(f"{rule.name}\t{rule.path_regex or '*'}\t{backends}")
         return 0
 
 
 @subcommand
-class LsFilesCommand(Subcommand):
+class LsFilesCommand(FileCommand):
     name = "ls-files"
     help = "list files caught by a creation rule"
-
-    def configure(self, parser: argparse.ArgumentParser) -> None:
-        super().configure(parser)
-        path_argument(parser, "limit the listing to these paths")
-        parser.add_argument(
-            "--full-name",
-            action="store_true",
-            help="show paths relative to the repository root",
-        )
+    paths_help = "limit the listing to these paths"
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
-        roots = [_resolve(path, args) for path in args.paths]
-        async for path, _rule in config.files(roots):
+        for path, _rule in await config.files(self.roots(args)):
             print(_display(config, path, args))
         return 0
 
@@ -702,393 +1056,139 @@ class MatchCommand(Subcommand):
 # porcelain commands
 # --------------------------------------------------------------------------- #
 @subcommand
-class StatusCommand(Subcommand):
+class StatusCommand(FileCommand):
     name = "status"
     help = "report whether matched files are encrypted"
+    paths_help = "limit the report to these paths"
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
         super().configure(parser)
-        path_argument(parser, "limit the report to these paths")
-        parser.add_argument("--branch", "-b", action="store_true", help="show the repository header")
         parser.add_argument(
-            "--porcelain",
-            action="store_true",
+            "--branch", "-b", action="store_true", help="show the repository header"
+        )
+        parser.add_argument(
+            "--porcelain", action="store_true",
             help="machine-readable output: '<code>\\t<path>'",
         )
         parser.add_argument(
-            "--full-name",
-            action="store_true",
-            help="show paths relative to the repository root",
-        )
-        parser.add_argument(
-            "--decrypt-check",
-            "-d",
-            action="store_true",
+            "--decrypt-check", "-d", action="store_true",
             help="try to decrypt each file and mark the ones that open",
         )
-        parser.add_argument(
-            "--age-key-file",
-            action="append",
-            default=[],
-            metavar="FILE",
-            help="age identity file to check against (with --decrypt-check/-d; repeatable)",
+        _add_age_key_file(
+            parser, "age identity file to check against (with --decrypt-check/-d; repeatable)"
         )
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
-        sops = shutil.which("sops")
-        if sops is None:
-            print("sops-tool: sops not found in PATH", file=sys.stderr)
-            return 127
-
-        roots = [_resolve(path, args) for path in args.paths]
+        sops = Sops.require()
         key_files = _resolve_key_files(args)
-        available = (
-            _available_age_keys(key_files, include_env=True) if args.decrypt_check else set()
-        )
-
-        entries = await _collect_entries(config, roots, sops, args)
-        if args.decrypt_check:
-            await _mark_decryptable(config, sops, entries, key_files)
+        matches = await config.files(self.roots(args))
+        inspections = await inspect_all(sops, [path for path, _rule in matches])
+        rows = [
+            _status_row(config, path, rule, inspection, args)
+            for (path, rule), inspection in zip(matches, inspections)
+        ]
 
         if args.porcelain:
-            for entry in entries:
-                print(f"{PORCELAIN_CODE[entry.state]}\t{entry.path}")
+            for row in rows:
+                print(f"{row.state.code}\t{row.path}")
             return 0
 
-        _print_report(entries, config.key_names, available, config.root if args.branch else None)
+        available: frozenset[Key] = frozenset()
+        decryptable: frozenset[Path] = frozenset()
+        if args.decrypt_check:
+            available = frozenset(await available_age_keys(key_files, include_env=True))
+            decryptable = await _probe_decryptable(sops, config, rows, key_files)
+
+        Reporter().status(
+            rows,
+            config.key_names,
+            available,
+            decryptable,
+            config.root if args.branch else None,
+        )
         return 0
 
 
-@dataclass
-class StatusEntry:
-    """One file's report: its state plus the keys it has and the rule expects."""
+async def _probe_decryptable(
+    sops: Sops, config: Config, rows: Sequence[Row], key_files: Sequence[Path]
+) -> frozenset[Path]:
+    """Ask sops to open every encrypted file; collect the ones it can.
 
-    path: str
-    state: str
-    keys: set[Key]
-    expected: set[Key]
-    extra: set[Key]
-    missing: set[Key]
-    unknown: bool
-    error: str | None
-    source: Path
-    decryptable: bool = False
-
-
-def _status_entry(
-    config: Config,
-    path: Path,
-    rule: Rule,
-    encrypted: bool | None,
-    error: str | None,
-    actual: set[Key] | None,
-    args: argparse.Namespace,
-) -> StatusEntry:
-    expected = rule.keys()
-    display = _display(config, path, args)
-
-    if error is not None and _is_read_error(error):
-        return StatusEntry(display, STATE_ERROR, set(), expected, set(), set(), True, error, path)
-    if error is not None or not encrypted:
-        # sops could not parse the file, or it simply is not encrypted: either
-        # way it is not a sops document, so report it as plaintext.
-        return StatusEntry(display, STATE_PLAIN, set(), expected, set(), set(expected), False, None, path)
-    if actual is None:
-        return StatusEntry(display, STATE_ENCRYPTED, set(), expected, set(), set(), True, None, path)
-
-    extra, missing = actual - expected, expected - actual
-    if extra:
-        # The file carries a key the rule does not -> a red `-` -> rotate.
-        state = STATE_ROTATE
-    elif missing:
-        # The rule wants a key the file lacks -> a green `+` -> updatekeys.
-        state = STATE_UPDATEKEYS
-    else:
-        state = STATE_ENCRYPTED
-    return StatusEntry(display, state, actual, expected, extra, missing, False, None, path)
-
-
-async def _collect_entries(
-    config: Config, roots: Sequence[Path], sops: str, args: argparse.Namespace
-) -> list[StatusEntry]:
-    """Inspect every matched file once, for both `status` and `decrypt`."""
-    matches = [entry async for entry in config.files(roots)]
-    limit = asyncio.Semaphore(MAX_CONCURRENCY)
-
-    async def inspect(path: Path) -> tuple[bool | None, str | None, set[Key] | None]:
-        async with limit:
-            encrypted, error = await filestatus(path, sops)
-            actual = None
-            if error is None and encrypted:
-                actual = await asyncio.to_thread(_actual_keys, path)
-        return encrypted, error, actual
-
-    results = await asyncio.gather(*(inspect(path) for path, _rule in matches))
-    return [
-        _status_entry(config, path, rule, encrypted, error, actual, args)
-        for (path, rule), (encrypted, error, actual) in zip(matches, results)
-    ]
-
-
-async def _mark_decryptable(
-    config: Config,
-    sops: str,
-    entries: Sequence[StatusEntry],
-    key_files: Sequence[Path],
-) -> None:
-    """Try `sops --decrypt` on every encrypted entry and flag the ones that open.
-
-    Naming is best-effort (see `_available_age_keys`); a key can also reach sops
+    Naming is best-effort (see `available_age_keys`); a key can also reach sops
     through sources we cannot enumerate — an SSH key, a key service, … — so the
     only honest test of "does this open?" is to ask sops.
     """
-    decryptable = {STATE_ENCRYPTED, STATE_UPDATEKEYS, STATE_ROTATE}
+    targeted = [row for row in rows if row.state in ENCRYPTED_STATES]
     env, temporary = _age_key_env(key_files)
     limit = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    async def check(entry: StatusEntry) -> None:
-        if entry.state not in decryptable:
-            return
+    async def check(row: Row) -> Path | None:
         async with limit:
-            failure = await _run_sops(config, sops, "decrypt", entry.source, env, in_place=False)
-        entry.decryptable = failure is None
+            failure = await sops.change(config, "decrypt", row.source, env, in_place=False)
+        return row.source if failure is None else None
 
     try:
-        await asyncio.gather(*(check(entry) for entry in entries))
+        results = await asyncio.gather(*(check(row) for row in targeted))
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-
-
-def _key_tokens(entry: StatusEntry, labels: Mapping[Key, str]) -> list[tuple[str, str | None]]:
-    """Diff the file's keys against the rule's: white same, green `+` extra, red `-` missing."""
-    if entry.unknown:
-        return [("?", None)]
-    tokens: list[tuple[str, str | None]] = []
-    for key in sorted(entry.keys | entry.expected, key=lambda key: labels.get(key, key[1])):
-        label = labels.get(key, key[1])
-        if key in entry.keys and key in entry.expected:
-            tokens.append((label, None))  # matches .sops.yaml -> white
-        elif key in entry.expected:
-            tokens.append((f"+{label}", "green"))  # .sops.yaml has it, file lacks it
-        else:
-            tokens.append((f"-{label}", "red"))  # file has it, .sops.yaml lacks it
-    return tokens or [("-", None)]
-
-
-def _print_report(
-    entries: Sequence[StatusEntry],
-    key_names: Mapping[Key, str],
-    available: set[Key],
-    branch_root: Path | None = None,
-) -> None:
-    all_keys = {key for entry in entries for key in entry.keys | entry.expected} | set(available)
-    pronouns = _pronouns(key for key in all_keys if key not in key_names)
-    labels = {key: key_names.get(key) or pronouns[key] for key in all_keys}
-    color = sys.stdout.isatty()
-
-    if labels:
-        # Named keys keep their name; unnamed ones get a `backend~index` pronoun;
-        # the keys we can decrypt with are highlighted.
-        for key in sorted(all_keys, key=lambda key: labels[key]):
-            shade = "orange" if key in available else None
-            print(_paint(f"{labels[key]}: {key[1]}", shade, color))
-        print()
-
-    if branch_root is not None:
-        print(f"## {branch_root}")
-
-    tokens = [_key_tokens(entry, labels) for entry in entries]
-    matched = [
-        [key for key in sorted(entry.keys, key=lambda key: labels[key]) if key in available]
-        for entry in entries
-    ]
-    plain_keys = [" ".join(text for text, _shade in row) for row in tokens]
-    plain_match = [
-        " ".join(f"*{labels[key]}" for key in row) if row else ("*" if entry.decryptable else "")
-        for entry, row in zip(entries, matched)
-    ]
-    width_path = max((len(entry.path) for entry in entries), default=0)
-    width_keys = max((len(text) for text in plain_keys if text != "-"), default=0)
-    width_match = max((len(text) for text in plain_match), default=0)
-
-    for entry, row, plain, keys_used, match_plain in zip(
-        entries, tokens, plain_keys, matched, plain_match
-    ):
-        label = _paint(entry.state.ljust(LABEL_WIDTH), STATE_COLOR[entry.state], color)
-        line = f"{label}  {entry.path.ljust(width_path)}"
-        if width_keys:
-            colored = _paint_tokens(row, color)
-            line += f"  {colored}{' ' * (width_keys - len(plain))}"
-        if width_match:
-            # Last column: `*name` for each of our keys that opens this file —
-            # or a bare `*` when sops decrypts it through some other means.
-            if keys_used:
-                match = " ".join(_paint(f"*{labels[key]}", "orange", color) for key in keys_used)
-            elif entry.decryptable:
-                match = _paint("*", "orange", color)
-            else:
-                match = ""
-            line += f"  {match}{' ' * (width_match - len(match_plain))}"
-        line = line.rstrip()
-        if entry.error is not None:
-            line += f"  {entry.error}"
-        print(line)
-
-
-# --------------------------------------------------------------------------- #
-# porcelain: encrypt / decrypt
-# --------------------------------------------------------------------------- #
-ENCRYPT_COLOR = {
-    "encrypted": "green",
-    "would encrypt": "yellow",
-    "skipped": None,
-    "error": "red",
-}
-DECRYPT_COLOR = {
-    "decrypted": "green",
-    "would decrypt": "yellow",
-    "skipped": None,
-    "error": "red",
-}
-
-
-def _emit_state(
-    color: bool,
-    width: int,
-    palette: Mapping[str, str | None],
-    state: str,
-    path: str,
-    detail: str | None = None,
-) -> None:
-    label = _paint(state.ljust(width), palette.get(state), color)
-    print(f"{label}  {path}" + (f"  {detail}" if detail else ""))
-
-
-async def _confirm(verb: str, display: str) -> bool:
-    answer = await asyncio.to_thread(input, f"{verb} {display}? [y/N] ")
-    return answer.strip().lower() in {"y", "yes"}
-
-
-def _action_arguments(parser: argparse.ArgumentParser, verb: str) -> None:
-    path_argument(parser, "limit to these paths")
-    parser.add_argument("-n", "--dry-run", action="store_true", help=f"only show what would be {verb}ed")
-    parser.add_argument("-i", "--interactive", action="store_true", help=f"confirm each file before {verb}ing")
-    parser.add_argument("--full-name", action="store_true", help="show paths relative to the repository root")
+    return frozenset(path for path in results if path is not None)
 
 
 @subcommand
-class EncryptCommand(Subcommand):
+class EncryptCommand(ActionCommand):
     name = "encrypt"
     help = "encrypt, in place, every matched file that is not encrypted yet"
 
-    def configure(self, parser: argparse.ArgumentParser) -> None:
-        super().configure(parser)
-        _action_arguments(parser, "encrypt")
+    verb = "encrypt"
+    would = WOULD_ENCRYPT
+    done = ENCRYPTED
 
-    async def run(self, config: Config, args: argparse.Namespace) -> int:
-        sops = shutil.which("sops")
-        if sops is None:
-            print("sops-tool: sops not found in PATH", file=sys.stderr)
-            return 127
+    def target(self, state: State) -> bool:
+        return state is PLAIN
 
-        roots = [_resolve(path, args) for path in args.paths]
-        matches = [entry async for entry in config.files(roots)]
-
-        color = sys.stdout.isatty()
-        width = max(len(state) for state in ENCRYPT_COLOR)
-        acted = errors = 0
-
-        for path, _rule in matches:
-            display = _display(config, path, args)
-            encrypted, error = await filestatus(path, sops)
-
-            if error is not None and _is_read_error(error):
-                _emit_state(color, width, ENCRYPT_COLOR, "error", display, error)
-                errors += 1
-                continue
-            if encrypted:
-                continue  # already a sops document
-            if args.dry_run:
-                _emit_state(color, width, ENCRYPT_COLOR, "would encrypt", display)
-                acted += 1
-                continue
-            if args.interactive and not await _confirm("encrypt", display):
-                _emit_state(color, width, ENCRYPT_COLOR, "skipped", display)
-                continue
-
-            failure = await _run_sops(config, sops, "encrypt", path)
-            if failure is None:
-                _emit_state(color, width, ENCRYPT_COLOR, "encrypted", display)
-                acted += 1
-            else:
-                _emit_state(color, width, ENCRYPT_COLOR, "error", display, failure)
-                errors += 1
-
-        if acted == 0 and errors == 0:
-            print("nothing to encrypt")
-        return 1 if errors else 0
+    async def mutate(
+        self,
+        sops: Sops,
+        config: Config,
+        path: Path,
+        env: Mapping[str, str] | None,
+        in_place: bool,
+    ) -> str | None:
+        return await sops.change(config, "encrypt", path)
 
 
 @subcommand
-class DecryptCommand(Subcommand):
+class DecryptCommand(ActionCommand):
     name = "decrypt"
-    help = "decrypt, in place, every matched file that is encrypted"
+    help = "decrypt, in place, every matched file that is encrypted (a thin sops wrapper)"
+
+    verb = "decrypt"
+    would = WOULD_DECRYPT
+    done = DECRYPTED
+    probe_dry_run = True  # only sops can say whether a key is at hand
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
         super().configure(parser)
-        _action_arguments(parser, "decrypt")
-        parser.add_argument(
-            "--age-key-file",
-            action="append",
-            default=[],
-            metavar="FILE",
-            help="age identity file to decrypt with (repeatable)",
-        )
+        _add_age_key_file(parser, "age identity file to decrypt with (repeatable)")
 
-    async def run(self, config: Config, args: argparse.Namespace) -> int:
-        sops = shutil.which("sops")
-        if sops is None:
-            print("sops-tool: sops not found in PATH", file=sys.stderr)
-            return 127
+    def target(self, state: State) -> bool:
+        return state is ENCRYPTED
 
-        roots = [_resolve(path, args) for path in args.paths]
-        key_files = _resolve_key_files(args)
-        env, temporary = _age_key_env(key_files)
-        try:
-            matches = [entry async for entry in config.files(roots)]
+    def identity_environment(
+        self, args: argparse.Namespace
+    ) -> tuple[dict[str, str] | None, Path | None]:
+        return _age_key_env(_resolve_key_files(args))
 
-            color = sys.stdout.isatty()
-            width = max(len(state) for state in DECRYPT_COLOR)
-            acted = errors = 0
-
-            for path, _rule in matches:
-                display = _display(config, path, args)
-                encrypted, error = await filestatus(path, sops)
-                if error is not None or not encrypted:
-                    continue  # unreadable, or already plaintext
-
-                if not args.dry_run and args.interactive and not await _confirm("decrypt", display):
-                    _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
-                    continue
-
-                # Always try, and report verbatim what sops says: this command is a
-                # thin wrapper, not a "smart" filter.
-                failure = await _run_sops(config, sops, "decrypt", path, env, in_place=not args.dry_run)
-                if failure is None:
-                    state = "would decrypt" if args.dry_run else "decrypted"
-                    _emit_state(color, width, DECRYPT_COLOR, state, display)
-                    acted += 1
-                else:
-                    _emit_state(color, width, DECRYPT_COLOR, "error", display, failure)
-                    errors += 1
-
-            if acted == 0 and errors == 0:
-                print("nothing to decrypt")
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-        return 1 if errors else 0
+    async def mutate(
+        self,
+        sops: Sops,
+        config: Config,
+        path: Path,
+        env: Mapping[str, str] | None,
+        in_place: bool,
+    ) -> str | None:
+        return await sops.change(config, "decrypt", path, env, in_place=in_place)
 
 
 # --------------------------------------------------------------------------- #
@@ -1119,9 +1219,9 @@ async def run(args: argparse.Namespace) -> int:
     try:
         config = await Config.discover(Path(args.directory) if args.directory else None)
         return await args.command.run(config, args)
-    except ConfigError as exc:
+    except ToolError as exc:
         print(f"sops-tool: {exc}", file=sys.stderr)
-        return 2
+        return exc.code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
