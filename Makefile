@@ -36,7 +36,9 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	mkdir -p $(PLAYGROUND)/secrets $(PLAYGROUND)/config $(PLAYGROUND)/app $(PLAYGROUND)/deploy/prod $(PLAYGROUND)/keys $(PLAYGROUND)/data
 
 	$(AGE_KEYGEN) -o $(PLAYGROUND)/keys/age.txt >/dev/null
+	$(AGE_KEYGEN) -o $(PLAYGROUND)/keys/age2.txt >/dev/null
 	recipient=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/keys/age.txt)
+	recipient2=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/keys/age2.txt)
 
 	printf '%s\n' \
 		'# Sample config. Rules are tried in order; the first match wins.' \
@@ -44,13 +46,13 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 		'  - path_regex: ^secrets/prod\.yaml$$' \
 		'    age: __RECIPIENT__' \
 		'  - path_regex: ^secrets/' \
-		'    age: __RECIPIENT__' \
+		'    age: __RECIPIENT__,__RECIPIENT2__' \
 		'  - path_regex: \.yaml$$' \
 		'    age: __RECIPIENT__' \
 		'  - path_regex: ^data/' \
 		'    age: __RECIPIENT__' \
 		> $(PLAYGROUND)/.sops.yaml
-	sed -i "s|__RECIPIENT__|$$recipient|g" $(PLAYGROUND)/.sops.yaml
+	sed -i -e "s|__RECIPIENT2__|$$recipient2|g" -e "s|__RECIPIENT__|$$recipient|g" $(PLAYGROUND)/.sops.yaml
 
 	printf '%s\n' \
 		'database:' \
@@ -74,6 +76,11 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 		'note: forgotten to encrypt' \
 		> $(PLAYGROUND)/secrets/extra.yaml
 	printf '%s\n' \
+		'# matched by the secrets rule, encrypted to age~0 only while the' \
+		'# rule also expects age~1, so `status` reports drift' \
+		'scope: drift-demo' \
+		> $(PLAYGROUND)/secrets/drift.yaml
+	printf '%s\n' \
 		'# matched by the dot-yaml catch-all rule, left unencrypted' \
 		'debug: false' \
 		> $(PLAYGROUND)/app/settings.yaml
@@ -91,9 +98,12 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/secrets/prod.yaml
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/secrets/dev.yaml
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/config/db.yaml
+	# Encrypt to age~0 only, although the matching rule also expects age~1,
+	# so this file shows up as `drift`.
+	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient" --encrypt --in-place $(PLAYGROUND)/secrets/drift.yaml
 
 	touch $(STAMP)
-	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:    secrets/prod.yaml, secrets/dev.yaml, config/db.yaml' '  plaintext:    secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:  notes.txt' '  filestatus !: data/blob.bin' '' 'try: make demo'
+	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:    secrets/prod.yaml, config/db.yaml' '  multi-key:    secrets/dev.yaml (two keys, tracked)' '  drift:        secrets/drift.yaml (one expected key missing)' '  plaintext:    secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml' '  not matched:  notes.txt' '  filestatus !: data/blob.bin' '' 'try: make demo'
 
 playground: $(STAMP)
 
@@ -108,8 +118,8 @@ demo: $(STAMP)
 	$(EASY_SOPS) -C $(PLAYGROUND) match secrets/dev.yaml
 	printf '\n=== match notes.txt (unmatched, exits 1) ===\n'
 	$(EASY_SOPS) -C $(PLAYGROUND) match notes.txt || true
-	printf '\n=== status ===\n'
-	$(EASY_SOPS) -C $(PLAYGROUND) status
+	printf '\n=== status --branch ===\n'
+	$(EASY_SOPS) -C $(PLAYGROUND) status --branch
 	printf '\n=== status --porcelain ===\n'
 	$(EASY_SOPS) -C $(PLAYGROUND) status --porcelain
 

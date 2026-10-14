@@ -31,26 +31,39 @@ Commands follow git's porcelain/plumbing split:
 ## Usage
 
 `status` mirrors `git status --short [--branch]`: one line per matched file,
-with a coloured status word, and paths relative to the current directory. Add
-`--branch` for a `##` header.
+with a coloured status word, and paths relative to the current directory. Each
+line also names the master key(s) the file belongs to, and — when a file has
+more than one key, or its keys drift from the config — the tracking state.
+
+sops keys have no human name, so each distinct key gets a short **pronoun**
+of the form `<backend>~<index>`, and the pronouns are defined at the top of the
+output:
 
 ```console
 $ easy-sops status --branch
+age~0: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+
 ## /repo
-encrypted      secrets/prod.yaml
-not encrypted  secrets/extra.yaml
-error          data/blob.bin
+encrypted      secrets/prod.yaml    age~0
+not encrypted  secrets/extra.yaml   age~0 age~1
+encrypted      secrets/dev.yaml     age~0 age~1  tracked
+encrypted      secrets/alt.yaml     age~1        drift -age~0
+error          data/blob.bin        age~0
 ```
 
-Paths are printed relative to the current directory by default; pass
-`--full-name` for repository-root-relative paths. Like git, a `--` separates
-options from paths, which limits the report to those paths:
+- **tracked** — the keys in the file match the matched rule's keys;
+- **drift** — they differ; `+key` marks an extra key, `-key` a missing one.
+
+Add `--branch` for the `##` header. Paths are printed relative to the current
+directory by default; pass `--full-name` for repository-root-relative paths.
+Like git, a `--` separates options from paths, which limits the report to those
+paths:
 
 ```console
 $ easy-sops status -- secrets config
-encrypted      secrets/prod.yaml
-not encrypted  secrets/extra.yaml
-encrypted      config/db.yaml
+encrypted      secrets/prod.yaml    age~0
+not encrypted  secrets/extra.yaml   age~0 age~1
+encrypted      config/db.yaml       age~0
 ```
 
 Machine-readable output mirrors `git status --porcelain`: one `<code>\t<path>`
@@ -93,10 +106,12 @@ $ make demo         # run every command against it
 $ make clean        # delete it
 ```
 
-The sandbox contains four kinds of files on purpose: encrypted ones, plaintext
-ones that are still caught by a rule, a file matched by no rule, and a binary
-that `sops filestatus` cannot classify. It also shows first-match win ordering
-between a specific `^secrets/prod\.yaml$` rule and broader ones.
+The sandbox contains several kinds of files on purpose: encrypted ones, a file
+encrypted to two keys (`tracked`), a file encrypted to fewer keys than its rule
+expects (`drift`), plaintext ones that are still caught by a rule, a file
+matched by no rule, and a binary that `sops filestatus` cannot classify. It also
+shows first-match win ordering between a specific `^secrets/prod\.yaml$` rule
+and broader ones.
 
 ## Matching semantics
 

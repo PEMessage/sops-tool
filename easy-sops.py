@@ -40,11 +40,11 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -58,6 +58,20 @@ BACKENDS = (
     "azure_keyvault",
     "hc_vault_transit_uri",
 )
+
+# A master key is identified by (backend, normalized identifier).
+Key = tuple[str, str]
+
+# Where each backend stores its identifier in a file's `sops:` metadata block.
+META_FIELD = {
+    "age": "recipient",
+    "pgp": "fp",
+    "kms": "arn",
+    "gcp_kms": "resource_id",
+    "hckms": "key_id",
+    "azure_keyvault": "vaultUrl",
+    "hc_vault_transit_uri": "uri",
+}
 
 # status -> (label, ansi color, porcelain code)
 STATUS_STYLE = {
@@ -99,6 +113,10 @@ class Rule:
         if self.fields.get("key_groups"):
             found.append("key_groups")
         return tuple(found)
+
+    def keys(self) -> set[Key]:
+        """The master keys this rule expects a file to be encrypted to."""
+        return _keys_from_fields(self.fields)
 
 
 class Config:
@@ -235,6 +253,85 @@ def _clean_error(stderr: str) -> str:
     if not match:
         return lines[-1]
     return match.group(1).replace('\\"', '"').replace("\\n", " ").replace("\\\\", "\\")
+
+
+# --------------------------------------------------------------------------- #
+# master keys
+# --------------------------------------------------------------------------- #
+def _normalize_key(backend: str, value: str) -> str:
+    value = value.strip()
+    if backend == "age":
+        return value.lower()
+    if backend == "pgp":
+        return value.replace(" ", "").upper()
+    return value
+
+
+def _as_list(value: Any) -> list[str]:
+    """sops accepts either a comma-separated string or a list for key fields."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _keys_from_fields(fields: Mapping[str, Any]) -> set[Key]:
+    """The master keys a creation rule expects (top-level fields + key_groups)."""
+    keys: set[Key] = set()
+    for backend in BACKENDS:
+        for value in _as_list(fields.get(backend)):
+            keys.add((backend, _normalize_key(backend, value)))
+    for group in fields.get("key_groups") or []:
+        if isinstance(group, Mapping):
+            keys |= _keys_from_fields(group)
+    return keys
+
+
+def _actual_keys(path: Path) -> set[Key] | None:
+    """Master keys a file is actually encrypted to, from its plaintext metadata.
+
+    Returns ``None`` when the format cannot be introspected (e.g. binary).
+    """
+    if path.suffix.lower() not in {".yaml", ".yml", ".json"}:
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, Mapping):
+        return None
+    block = data.get("sops")
+    if not isinstance(block, Mapping):
+        return None
+
+    keys: set[Key] = set()
+    for backend in BACKENDS:
+        entries = block.get(backend)
+        if entries is None:
+            continue
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if isinstance(entry, Mapping):
+                value = entry.get(META_FIELD[backend])
+                if value is None:
+                    continue
+            else:
+                value = entry
+            keys.add((backend, _normalize_key(backend, str(value))))
+    return keys
+
+
+def _pronouns(keys: Iterable[Key]) -> dict[Key, str]:
+    """Assign unnamed keys a `backend~index` pronoun, numbered per backend."""
+    counters: dict[str, int] = {}
+    result: dict[Key, str] = {}
+    for backend, identifier in sorted(set(keys)):
+        index = counters.get(backend, 0)
+        counters[backend] = index + 1
+        result[(backend, identifier)] = f"{backend}~{index}"
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -392,38 +489,114 @@ class StatusCommand(Subcommand):
 
         limit = asyncio.Semaphore(MAX_CONCURRENCY)
 
-        async def check(path: Path) -> tuple[bool | None, str | None]:
+        async def inspect(path: Path) -> tuple[bool | None, str | None, set[Key] | None]:
             async with limit:
-                return await filestatus(path, sops)
+                encrypted, error = await filestatus(path, sops)
+                actual = None
+                if error is None and encrypted:
+                    actual = await asyncio.to_thread(_actual_keys, path)
+            return encrypted, error, actual
 
-        results = await asyncio.gather(*(check(path) for path, _rule in matches))
+        results = await asyncio.gather(*(inspect(path) for path, _rule in matches))
 
-        entries: list[tuple[str, str, str | None]] = []
-        for (path, _rule), (encrypted, error) in zip(matches, results):
-            if error is not None:
-                state = "error"
-            elif encrypted:
-                state = "encrypted"
-            else:
-                state = "plain"
-            entries.append((_display(config, path, args), state, error))
+        entries = [
+            _status_entry(config, path, rule, encrypted, error, actual, args)
+            for (path, rule), (encrypted, error, actual) in zip(matches, results)
+        ]
 
         if args.porcelain:
-            for path, state, _error in entries:
-                print(f"{STATUS_STYLE[state][2]}\t{path}")
+            for entry in entries:
+                print(f"{STATUS_STYLE[entry.state][2]}\t{entry.path}")
             return 0
 
-        color = sys.stdout.isatty()
-        if args.branch:
-            print(f"## {config.root}")
-        for path, state, _error in entries:
-            label, shade, _code = STATUS_STYLE[state]
-            print(f"{_paint(label.ljust(LABEL_WIDTH), shade, color)}  {path}")
+        _print_status(entries, config.root if args.branch else None)
 
-        for path, _state, error in entries:
-            if error is not None:
-                print(f"{path}: {error}", file=sys.stderr)
+        for entry in entries:
+            if entry.error is not None:
+                print(f"{entry.path}: {entry.error}", file=sys.stderr)
         return 0
+
+
+@dataclass
+class StatusEntry:
+    """One file's report: encryption state plus its keys and tracking state."""
+
+    path: str
+    state: str
+    keys: set[Key]
+    expected: set[Key]
+    track: str  # "", "tracked", "drift" or "?"
+    extra: set[Key]
+    missing: set[Key]
+    error: str | None
+
+
+def _status_entry(
+    config: Config,
+    path: Path,
+    rule: Rule,
+    encrypted: bool | None,
+    error: str | None,
+    actual: set[Key] | None,
+    args: argparse.Namespace,
+) -> StatusEntry:
+    expected = rule.keys()
+    display = _display(config, path, args)
+
+    if error is not None:
+        return StatusEntry(display, "error", expected, expected, "", set(), set(), error)
+    if not encrypted:
+        return StatusEntry(display, "plain", expected, expected, "", set(), set(), None)
+    if actual is None:
+        return StatusEntry(display, "encrypted", expected, expected, "?", set(), set(), None)
+
+    extra, missing = actual - expected, expected - actual
+    track = "tracked" if not extra and not missing else "drift"
+    return StatusEntry(display, "encrypted", actual, expected, track, extra, missing, None)
+
+
+def _print_status(entries: Sequence[StatusEntry], branch_root: Path | None = None) -> None:
+    pronouns = _pronouns(key for entry in entries for key in entry.keys | entry.expected)
+
+    if pronouns:
+        # Unnamed keys get a `backend~index` pronoun; define them up top.
+        for key in sorted(pronouns):
+            print(f"{pronouns[key]}: {key[1]}")
+        print()
+
+    if branch_root is not None:
+        print(f"## {branch_root}")
+
+    def keys_text(entry: StatusEntry) -> str:
+        if not entry.keys:
+            return "-"
+        return " ".join(pronouns[key] for key in sorted(entry.keys))
+
+    def track_text(entry: StatusEntry) -> str:
+        if entry.track == "drift":
+            diff = [f"+{pronouns[key]}" for key in sorted(entry.extra)]
+            diff += [f"-{pronouns[key]}" for key in sorted(entry.missing)]
+            return "drift " + " ".join(diff)
+        return entry.track
+
+    def show_track(entry: StatusEntry) -> bool:
+        return entry.track in {"drift", "?"} or len(entry.keys | entry.expected) > 1
+
+    key_texts = [keys_text(entry) for entry in entries]
+    track_texts = [track_text(entry) if show_track(entry) else "" for entry in entries]
+    width_path = max((len(entry.path) for entry in entries), default=0)
+    width_keys = max((len(text) for text in key_texts if text != "-"), default=0)
+    width_track = max((len(text) for text in track_texts), default=0)
+
+    color = sys.stdout.isatty()
+    for entry, keys_text_, track_text_ in zip(entries, key_texts, track_texts):
+        label, shade, _code = STATUS_STYLE[entry.state]
+        line = f"{_paint(label.ljust(LABEL_WIDTH), shade, color)}  {entry.path.ljust(width_path)}"
+        if width_keys:
+            line += f"  {keys_text_.ljust(width_keys)}"
+        if width_track and track_text_:
+            line += f"  {track_text_}"
+        print(line.rstrip())
 
 
 # --------------------------------------------------------------------------- #
