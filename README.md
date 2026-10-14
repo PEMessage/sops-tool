@@ -88,12 +88,12 @@ The state words are named after the sops command that would fix the file:
   line, so it never disturbs the others.
 
 Add `--decrypt-check` (`-d`) to have `status` actually try to open each encrypted
-file
-(a read-only `sops --decrypt`) and mark the ones it can with an orange `*`. When
-the opening key is one of yours — from `--age-key-file FILE` (repeatable) — it is
-named (`*admin`) and highlighted orange in the legend. A bare `*` means sops
-could still open the file through a source we cannot see: an inline
-`SOPS_AGE_KEY`, a `SOPS_AGE_KEY_CMD`, a key service, and so on. Without
+file (a read-only `sops --decrypt`) and mark the ones it can with an orange `*`.
+The keys it can *name* — from `--age-key-file FILE` (repeatable) and the
+`SOPS_AGE_KEY`, `SOPS_AGE_KEY_FILE` and `SOPS_AGE_KEY_CMD` environment, whose
+public recipients it derives with `age-keygen -y` — are highlighted orange in the
+legend and named in the last column (`*admin`). A bare `*` means sops opened the
+file through a source we cannot name (an SSH key, a key service, …). Without
 `--decrypt-check`, `status` never touches keys and stays deterministic:
 
 ```console
@@ -102,12 +102,12 @@ admin:  age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 age~0:  age1azjar2evsuakyv9cjg66vhzvy3uwkw7uvu54fm9ewp9e4petdpkqzzpqrh
 backup: age1ck8af8dr5yq3j8sea5jxg58vvjmth6m80gq5tf2n09ztfqfrxd0stl8awd
 
-encrypted        config/db.yaml            age~0                  *age~0
+encrypted        config/db.yaml            age~0
 encrypted        secrets/dev.yaml          admin backup           *admin
 need updatekeys  secrets/missing-key.yaml  admin +backup          *admin
 
-$ SOPS_AGE_KEY="$(cat keys/age.txt)" sops-tool status --decrypt-check
-encrypted        secrets/prod.yaml         admin                  *
+$ SOPS_AGE_KEY="$(cat keys/age.txt)" sops-tool status -d
+encrypted        secrets/prod.yaml         admin                  *admin
 ```
 
 

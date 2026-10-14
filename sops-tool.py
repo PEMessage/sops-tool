@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -53,7 +54,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.19.0"
+__version__ = "0.20.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -402,29 +403,78 @@ def _child_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
     return {**os.environ, **env} if env else None
 
 
-def _age_recipients(paths: Sequence[Path], include_env: bool = False) -> set[str]:
-    """The age public keys available to decrypt with, from the identity files.
+AGE_KEY_ENV = "SOPS_AGE_KEY"
+AGE_KEY_FILE_ENV = "SOPS_AGE_KEY_FILE"
+AGE_KEY_CMD_ENV = "SOPS_AGE_KEY_CMD"
 
-    The `SOPS_AGE_KEY_FILE` environment is only consulted when *include_env* is
-    set, so `status` stays unaffected by the ambient environment.
+
+def _identity_texts(paths: Sequence[Path], include_env: bool) -> list[str]:
+    """Age identity *material* from our key files and the `SOPS_AGE_KEY*` env.
+
+    sops reads identities from many places; we mirror the ones that are plain
+    text and can be named — `SOPS_AGE_KEY`, `SOPS_AGE_KEY_FILE` and
+    `SOPS_AGE_KEY_CMD`. An SSH key, a key command that refuses to run, or a key
+    service simply yields nothing here; the `sops --decrypt` probe still covers
+    them.
     """
-    sources = list(paths)
-    if include_env:
-        env_file = os.environ.get("SOPS_AGE_KEY_FILE")
-        if env_file:
-            sources.append(Path(env_file).expanduser())
-    recipients: set[str] = set()
-    for path in sources:
+    texts: list[str] = []
+
+    def read(path: Path) -> None:
         try:
-            text = path.read_text(encoding="utf-8")
+            texts.append(path.read_text(encoding="utf-8"))
         except OSError:
-            continue
-        recipients.update(re.findall(r"#\s*public key:\s*(age1[0-9a-z]+)", text))
-    return recipients
+            pass
+
+    for path in paths:
+        read(path)
+    if include_env:
+        env_file = os.environ.get(AGE_KEY_FILE_ENV)
+        if env_file:
+            read(Path(env_file).expanduser())
+        inline = os.environ.get(AGE_KEY_ENV)
+        if inline:
+            texts.append(inline)
+        command = os.environ.get(AGE_KEY_CMD_ENV)
+        if command:
+            texts.append(_run_key_command(command))
+    return texts
+
+
+def _run_key_command(command: str) -> str:
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _age_recipients(texts: Iterable[str]) -> set[str]:
+    """The age public keys hiding in identity material, however we can find them.
+
+    `age-keygen -y` derives them properly from *any* identity (private key or
+    identity file) — that is how an inline `SOPS_AGE_KEY`, which carries only
+    secret keys, becomes a recipient we can name. The `# public key:` comments
+    age-keygen writes are a fallback for when it is not installed.
+    """
+    blob = "\n".join(texts)
+    if not blob.strip():
+        return set()
+    tool = shutil.which("age-keygen")
+    if tool is not None:
+        try:
+            result = subprocess.run(
+                [tool, "-y"], input=blob, capture_output=True, text=True, timeout=10
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0:
+            return set(re.findall(r"age1[0-9a-z]+", result.stdout))
+    return set(re.findall(r"#\s*public key:\s*(age1[0-9a-z]+)", blob))
 
 
 def _available_age_keys(key_files: Sequence[Path], include_env: bool = False) -> set[Key]:
-    return {("age", recipient) for recipient in _age_recipients(key_files, include_env)}
+    texts = _identity_texts(key_files, include_env)
+    return {("age", recipient) for recipient in _age_recipients(texts)}
 
 
 # --------------------------------------------------------------------------- #
@@ -788,8 +838,9 @@ async def _mark_decryptable(
 ) -> None:
     """Try `sops --decrypt` on every encrypted entry and flag the ones that open.
 
-    A key can reach sops in ways we cannot enumerate (inline `SOPS_AGE_KEY`, a
-    key command, a key service, …), so the only honest test is to ask sops.
+    Naming is best-effort (see `_available_age_keys`); a key can also reach sops
+    through sources we cannot enumerate — an SSH key, a key service, … — so the
+    only honest test of "does this open?" is to ask sops.
     """
     decryptable = {STATE_ENCRYPTED, STATE_UPDATEKEYS, STATE_ROTATE}
     env, temporary = _age_key_env(key_files)
