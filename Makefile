@@ -26,21 +26,21 @@ SHELL       := bash
 .ONESHELL:
 .DEFAULT_GOAL := help
 
-.PHONY: help playground demo status porcelain ls-rules ls-files match clean reset
+.PHONY: help playground demo status porcelain ls-rules ls-files match encrypt dry-run clean reset
 
 help:
-	@printf '%s\n' '' 'easy-sops playground' '' '  make playground   build ./$(PLAYGROUND)/ with sample rules and secrets' '  make demo         build it, then run every command against it' '  make status       easy-sops -C $(PLAYGROUND) status' '  make porcelain    easy-sops -C $(PLAYGROUND) status --porcelain' '  make ls-rules     list the sample creation rules' '  make ls-files     list files caught by the rules' '  make match        rule for FILE (default: $(FILE))' '  make clean        remove ./$(PLAYGROUND)/' '  make reset        clean, then rebuild' ''
+	@printf '%s\n' '' 'easy-sops playground' '' '  make playground   build ./$(PLAYGROUND)/ with sample rules and secrets' '  make demo         build it, then run every command against it' '  make status       easy-sops -C $(PLAYGROUND) status' '  make porcelain    easy-sops -C $(PLAYGROUND) status --porcelain' '  make ls-rules     list the sample creation rules' '  make ls-files     list files caught by the rules' '  make match        rule for FILE (default: $(FILE))' '  make encrypt      encrypt the not-yet-encrypted files in place' '  make dry-run      same, but only print what would be encrypted' '  make clean        remove ./$(PLAYGROUND)/' '  make reset        clean, then rebuild' ''
 
 $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	@rm -rf $(PLAYGROUND)
-	mkdir -p $(PLAYGROUND)/secrets $(PLAYGROUND)/config $(PLAYGROUND)/app $(PLAYGROUND)/deploy/prod $(PLAYGROUND)/kek $(PLAYGROUND)/data
+	mkdir -p $(PLAYGROUND)/secrets $(PLAYGROUND)/config $(PLAYGROUND)/app $(PLAYGROUND)/deploy/prod $(PLAYGROUND)/keys $(PLAYGROUND)/kek $(PLAYGROUND)/data
 
-	$(AGE_KEYGEN) -o $(PLAYGROUND)/kek/age.txt >/dev/null
-	$(AGE_KEYGEN) -o $(PLAYGROUND)/kek/age2.txt >/dev/null
-	$(AGE_KEYGEN) -o $(PLAYGROUND)/kek/age3.txt >/dev/null
-	recipient=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/kek/age.txt)
-	recipient2=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/kek/age2.txt)
-	recipient3=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/kek/age3.txt)
+	$(AGE_KEYGEN) -o $(PLAYGROUND)/keys/age.txt >/dev/null
+	$(AGE_KEYGEN) -o $(PLAYGROUND)/keys/age2.txt >/dev/null
+	$(AGE_KEYGEN) -o $(PLAYGROUND)/keys/age3.txt >/dev/null
+	recipient=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/keys/age.txt)
+	recipient2=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/keys/age2.txt)
+	recipient3=$$($(AGE_KEYGEN) -y $(PLAYGROUND)/keys/age3.txt)
 
 	printf '%s\n' \
 		'# Sample config. Rules are tried in order; the first match wins.' \
@@ -114,6 +114,12 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	printf '%s\n' \
 		'not matched by any rule, so easy-sops never lists this file' \
 		> $(PLAYGROUND)/notes.txt
+	# `kek/` is just special *data*: a .txt encrypted by a key. The real sops
+	# keys live in keys/ and are deliberately not covered by any rule.
+	printf '%s\n' \
+		'# key-encryption-key material, stored encrypted at rest' \
+		'kek: 8f4c1d9a2b7e6053' \
+		> $(PLAYGROUND)/kek/data.txt
 
 	head -c 64 /dev/urandom > $(PLAYGROUND)/data/blob.bin
 	# A broken symlink: sops cannot read it, so `status` reports `error`.
@@ -127,9 +133,11 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient" --encrypt --in-place $(PLAYGROUND)/secrets/missing-key.yaml
 	# The file has a key the rule lacks -> minus-sign drift -> `need rotate`.
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient,$$recipient2" --encrypt --in-place $(PLAYGROUND)/app/extra-key.yaml
+	# The KEK is data, so the ^kek/ rule encrypts it (a .txt becomes JSON).
+	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --encrypt --in-place $(PLAYGROUND)/kek/data.txt
 
 	touch $(STAMP)
-	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  named keys:      admin, backup (from .sops.yaml anchors)' '  inline key:      one rule uses a bare recipient -> shown as a pronoun' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml, data/blob.bin' '  kek (covered):   kek/age.txt, kek/age2.txt, kek/age3.txt (the sops age keys)' '  not matched:     notes.txt' '  error:           data/broken.yaml (unreadable symlink)' '' 'try: make demo'
+	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  named keys:      admin, backup (from .sops.yaml anchors)' '  inline key:      one rule uses a bare recipient -> shown as a pronoun' '  encrypted:       secrets/prod.yaml, config/db.yaml, kek/data.txt' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml, data/blob.bin' '  sops keys:       keys/age*.txt (the real keys; not rule-covered, not listed)' '  kek (data):      kek/data.txt (a txt encrypted by one of those keys)' '  not matched:     notes.txt' '  error:           data/broken.yaml (unreadable symlink)' '' 'try: make demo'
 
 playground: $(STAMP)
 
@@ -163,6 +171,12 @@ ls-files: $(STAMP)
 
 match: $(STAMP)
 	@$(EASY_SOPS) -C $(PLAYGROUND) match $(FILE)
+
+encrypt: $(STAMP)
+	@$(EASY_SOPS) -C $(PLAYGROUND) encrypt || true
+
+dry-run: $(STAMP)
+	@$(EASY_SOPS) -C $(PLAYGROUND) encrypt --dry-run || true
 
 clean:
 	@rm -rf $(PLAYGROUND)

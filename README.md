@@ -66,8 +66,8 @@ backup: age1ck8af8dr5yq3j8sea5jxg58vvjmth6m80gq5tf2n09ztfqfrxd0stl8awd
 ## /repo
 encrypted        config/db.yaml            age~0
 encrypted        secrets/dev.yaml          admin backup
+encrypted        kek/data.txt              admin backup
 not encrypted    secrets/extra.yaml        +admin +backup
-not encrypted    kek/age.txt               +admin +backup
 need updatekeys  secrets/missing-key.yaml  admin +backup
 need rotate      app/extra-key.yaml        -admin +age~0 -backup
 error            data/broken.yaml          ?  <sops filestatus message>
@@ -146,8 +146,8 @@ $ easy-sops match secrets/prod.yaml
 #0
 ```
 
-`status` calls `sops filestatus` for each matched file; a file sops cannot
-classify is reported as an error.
+`status` calls `sops filestatus` for each matched file. A file sops cannot parse
+is treated as `not encrypted`; only a file it cannot *read* shows up as `error`.
 
 ## Playground
 
@@ -164,16 +164,24 @@ $ make clean        # delete it
 
 The sandbox contains several kinds of files on purpose: correctly encrypted
 ones (including one with two keys), a file that is `need updatekeys`, a file
-that is `need rotate`, plaintext files still caught by a rule, a key file and a
-binary that sops cannot parse (both reported as `not encrypted`), a file matched
-by no rule, and an unreadable symlink that shows up as `error`. It also shows
-first-match win ordering between a specific `^secrets/prod\.yaml$` rule and
-broader ones.
+that is `need rotate`, plaintext files still caught by a rule, a binary and a
+key file that sops cannot parse (both reported as `not encrypted`), a file
+matched by no rule, and an unreadable symlink that shows up as `error`. It also
+shows first-match win ordering between a specific `^secrets/prod\.yaml$` rule
+and broader ones.
 
-The age master keys — the KEKs (key encryption keys) that sops unlocks a file's
-data key with — live in `kek/`. They are regenerated on every `make reset` and
-are listed by `status` through their own `^kek/` rule (as plaintext; a KEK is
-never encrypted with itself).
+Two folders make the key story concrete:
+
+- `keys/` holds the real age master keys that sops uses to unlock a file's data
+  key. They are regenerated on every `make reset`, and are deliberately **not**
+  covered by any creation rule — they are the keys, not encrypted data.
+- `kek/` holds a *key-encryption-key*, but only as ordinary **data**: a `.txt`
+  that is itself encrypted by one of the keys (`kek/data.txt`), so `status`
+  lists it like any other encrypted file.
+
+`make encrypt` encrypts the sandbox's still-plaintext files in place (and
+`make dry-run` only prints what it would do); `keys/` is untouched because no
+rule covers it.
 
 ## Matching semantics
 
