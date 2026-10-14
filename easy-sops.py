@@ -44,7 +44,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -73,13 +73,28 @@ META_FIELD = {
     "hc_vault_transit_uri": "uri",
 }
 
-# status -> (label, ansi color, porcelain code)
-STATUS_STYLE = {
-    "encrypted": ("encrypted", "green", "E"),
-    "plain": ("not encrypted", "yellow", "U"),
-    "error": ("error", "red", "!"),
+# File states, named after the sops command that would fix them.
+STATE_ENCRYPTED = "encrypted"
+STATE_PLAIN = "not encrypted"
+STATE_UPDATEKEYS = "need updatekeys"
+STATE_ROTATE = "need rotate"
+STATE_ERROR = "error"
+
+STATE_COLOR = {
+    STATE_ENCRYPTED: "green",
+    STATE_PLAIN: "yellow",
+    STATE_UPDATEKEYS: "yellow",
+    STATE_ROTATE: "yellow",
+    STATE_ERROR: "red",
 }
-LABEL_WIDTH = max(len(label) for label, _color, _code in STATUS_STYLE.values())
+PORCELAIN_CODE = {
+    STATE_ENCRYPTED: "E",
+    STATE_PLAIN: "U",
+    STATE_UPDATEKEYS: "-",
+    STATE_ROTATE: "+",
+    STATE_ERROR: "!",
+}
+LABEL_WIDTH = max(len(state) for state in STATE_COLOR)
 
 ANSI = {"reset": "\033[0m", "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m"}
 
@@ -506,7 +521,7 @@ class StatusCommand(Subcommand):
 
         if args.porcelain:
             for entry in entries:
-                print(f"{STATUS_STYLE[entry.state][2]}\t{entry.path}")
+                print(f"{PORCELAIN_CODE[entry.state]}\t{entry.path}")
             return 0
 
         _print_status(entries, config.root if args.branch else None)
@@ -519,15 +534,15 @@ class StatusCommand(Subcommand):
 
 @dataclass
 class StatusEntry:
-    """One file's report: encryption state plus its keys and tracking state."""
+    """One file's report: its state plus the keys it has and the rule expects."""
 
     path: str
     state: str
     keys: set[Key]
     expected: set[Key]
-    track: str  # "", "tracked", "drift" or "?"
     extra: set[Key]
     missing: set[Key]
+    unknown: bool
     error: str | None
 
 
@@ -544,15 +559,36 @@ def _status_entry(
     display = _display(config, path, args)
 
     if error is not None:
-        return StatusEntry(display, "error", expected, expected, "", set(), set(), error)
+        return StatusEntry(display, STATE_ERROR, set(), expected, set(), set(), True, error)
     if not encrypted:
-        return StatusEntry(display, "plain", expected, expected, "", set(), set(), None)
+        return StatusEntry(display, STATE_PLAIN, set(), expected, set(), set(expected), False, None)
     if actual is None:
-        return StatusEntry(display, "encrypted", expected, expected, "?", set(), set(), None)
+        return StatusEntry(display, STATE_ENCRYPTED, set(), expected, set(), set(), True, None)
 
     extra, missing = actual - expected, expected - actual
-    track = "tracked" if not extra and not missing else "drift"
-    return StatusEntry(display, "encrypted", actual, expected, track, extra, missing, None)
+    if extra:
+        state = STATE_ROTATE  # encrypted to keys the rule no longer wants
+    elif missing:
+        state = STATE_UPDATEKEYS  # rule wants keys the file does not have
+    else:
+        state = STATE_ENCRYPTED
+    return StatusEntry(display, state, actual, expected, extra, missing, False, None)
+
+
+def _key_tokens(entry: StatusEntry, pronouns: Mapping[Key, str]) -> list[tuple[str, str | None]]:
+    """Signed, coloured pronouns: `+` present, `-` expected-but-absent."""
+    if entry.unknown:
+        return [("?", None)]
+    tokens: list[tuple[str, str | None]] = []
+    for key in sorted(entry.keys | entry.expected):
+        pronoun = pronouns[key]
+        if key in entry.keys and key in entry.expected:
+            tokens.append((f"+{pronoun}", "green"))  # present and expected
+        elif key in entry.keys:
+            tokens.append((f"+{pronoun}", "red"))  # present but not expected
+        else:
+            tokens.append((f"-{pronoun}", "red"))  # expected but not present
+    return tokens or [("-", None)]
 
 
 def _print_status(entries: Sequence[StatusEntry], branch_root: Path | None = None) -> None:
@@ -567,35 +603,18 @@ def _print_status(entries: Sequence[StatusEntry], branch_root: Path | None = Non
     if branch_root is not None:
         print(f"## {branch_root}")
 
-    def keys_text(entry: StatusEntry) -> str:
-        if not entry.keys:
-            return "-"
-        return " ".join(pronouns[key] for key in sorted(entry.keys))
-
-    def track_text(entry: StatusEntry) -> str:
-        if entry.track == "drift":
-            diff = [f"+{pronouns[key]}" for key in sorted(entry.extra)]
-            diff += [f"-{pronouns[key]}" for key in sorted(entry.missing)]
-            return "drift " + " ".join(diff)
-        return entry.track
-
-    def show_track(entry: StatusEntry) -> bool:
-        return entry.track in {"drift", "?"} or len(entry.keys | entry.expected) > 1
-
-    key_texts = [keys_text(entry) for entry in entries]
-    track_texts = [track_text(entry) if show_track(entry) else "" for entry in entries]
-    width_path = max((len(entry.path) for entry in entries), default=0)
-    width_keys = max((len(text) for text in key_texts if text != "-"), default=0)
-    width_track = max((len(text) for text in track_texts), default=0)
-
     color = sys.stdout.isatty()
-    for entry, keys_text_, track_text_ in zip(entries, key_texts, track_texts):
-        label, shade, _code = STATUS_STYLE[entry.state]
-        line = f"{_paint(label.ljust(LABEL_WIDTH), shade, color)}  {entry.path.ljust(width_path)}"
+    tokens = [_key_tokens(entry, pronouns) for entry in entries]
+    plain_keys = [" ".join(text for text, _shade in row) for row in tokens]
+    width_path = max((len(entry.path) for entry in entries), default=0)
+    width_keys = max((len(text) for text in plain_keys if text != "-"), default=0)
+
+    for entry, row, plain in zip(entries, tokens, plain_keys):
+        label = _paint(entry.state.ljust(LABEL_WIDTH), STATE_COLOR[entry.state], color)
+        line = f"{label}  {entry.path.ljust(width_path)}"
         if width_keys:
-            line += f"  {keys_text_.ljust(width_keys)}"
-        if width_track and track_text_:
-            line += f"  {track_text_}"
+            colored = " ".join(_paint(text, shade, color) if shade else text for text, shade in row)
+            line += f"  {colored}{' ' * (width_keys - len(plain))}"
         print(line.rstrip())
 
 

@@ -31,28 +31,38 @@ Commands follow git's porcelain/plumbing split:
 ## Usage
 
 `status` mirrors `git status --short [--branch]`: one line per matched file,
-with a coloured status word, and paths relative to the current directory. Each
-line also names the master key(s) the file belongs to, and — when a file has
-more than one key, or its keys drift from the config — the tracking state.
+with a coloured state word, and paths relative to the current directory. Each
+line also names the master key(s), compared against the keys the matching rule
+expects.
 
-sops keys have no human name, so each distinct key gets a short **pronoun**
-of the form `<backend>~<index>`, and the pronouns are defined at the top of the
-output:
+sops keys have no human name, so each distinct key gets a short **pronoun** of
+the form `<backend>~<index>`, and the pronouns are defined at the top of the
+output. Keys are signed: `+` is a key the file currently has, `-` one the rule
+expects but the file lacks. Green means the key is present *and* expected; red
+means it needs attention (extra or missing):
 
 ```console
 $ easy-sops status --branch
 age~0: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 
 ## /repo
-encrypted      secrets/prod.yaml    age~0
-not encrypted  secrets/extra.yaml   age~0 age~1
-encrypted      secrets/dev.yaml     age~0 age~1  tracked
-encrypted      secrets/alt.yaml     age~1        drift -age~0
-error          data/blob.bin        age~0
+encrypted        secrets/prod.yaml    +age~0
+encrypted        secrets/dev.yaml     +age~0 +age~1
+not encrypted    secrets/extra.yaml   -age~0 -age~1
+need updatekeys  secrets/drift.yaml   +age~0 -age~1
+need rotate      app/rotate.yaml      -age~0 +age~1
+error            data/blob.bin        ?
 ```
 
-- **tracked** — the keys in the file match the matched rule's keys;
-- **drift** — they differ; `+key` marks an extra key, `-key` a missing one.
+The state words are named after the sops command that would fix the file:
+
+- **encrypted** — the file's keys match the rule's;
+- **not encrypted** — the rule covers the file, but it is plaintext;
+- **need updatekeys** — the file is missing some keys the rule expects
+  (`sops updatekeys`);
+- **need rotate** — the file has keys the rule no longer expects
+  (`sops rotate`);
+- **error** — `sops filestatus` could not classify the file.
 
 Add `--branch` for the `##` header. Paths are printed relative to the current
 directory by default; pass `--full-name` for repository-root-relative paths.
@@ -61,18 +71,21 @@ paths:
 
 ```console
 $ easy-sops status -- secrets config
-encrypted      secrets/prod.yaml    age~0
-not encrypted  secrets/extra.yaml   age~0 age~1
-encrypted      config/db.yaml       age~0
+encrypted        secrets/prod.yaml    +age~0
+not encrypted    secrets/extra.yaml   -age~0 -age~1
+need updatekeys  secrets/drift.yaml   +age~0 -age~1
 ```
 
 Machine-readable output mirrors `git status --porcelain`: one `<code>\t<path>`
-line per file, with `E` (encrypted), `U` (unencrypted) or `!` (error):
+line per file, with `E` (encrypted), `U` (unencrypted), `+` (need rotate),
+`-` (need updatekeys) or `!` (error):
 
 ```console
 $ easy-sops status --porcelain
 !	data/blob.bin
++	app/rotate.yaml
 E	secrets/prod.yaml
+-	secrets/drift.yaml
 U	secrets/extra.yaml
 ```
 
@@ -106,12 +119,12 @@ $ make demo         # run every command against it
 $ make clean        # delete it
 ```
 
-The sandbox contains several kinds of files on purpose: encrypted ones, a file
-encrypted to two keys (`tracked`), a file encrypted to fewer keys than its rule
-expects (`drift`), plaintext ones that are still caught by a rule, a file
-matched by no rule, and a binary that `sops filestatus` cannot classify. It also
-shows first-match win ordering between a specific `^secrets/prod\.yaml$` rule
-and broader ones.
+The sandbox contains several kinds of files on purpose: correctly encrypted
+ones (including one with two keys), a file that is `need updatekeys`, a file
+that is `need rotate`, plaintext files still caught by a rule, a file matched by
+no rule, and a binary that `sops filestatus` cannot classify. It also shows
+first-match win ordering between a specific `^secrets/prod\.yaml$` rule and
+broader ones.
 
 ## Matching semantics
 
