@@ -180,10 +180,11 @@ dry-run: $(STAMP)
 
 decrypt: $(STAMP)
 	@$(SOPS_TOOL) -C $(PLAYGROUND) decrypt \
-		$(foreach key,$(wildcard $(PLAYGROUND)/keys/age*.txt),--age-key-file $(key)) || true
+		$(foreach key,$(wildcard $(PLAYGROUND)/keys/age*.txt),--age-key-file $(CURDIR)/$(key)) || true
 
 decrypt-dry-run: $(STAMP)
-	@$(SOPS_TOOL) -C $(PLAYGROUND) decrypt --dry-run || true
+	@$(SOPS_TOOL) -C $(PLAYGROUND) decrypt --dry-run \
+		$(foreach key,$(wildcard $(PLAYGROUND)/keys/age*.txt),--age-key-file $(CURDIR)/$(key)) || true
 
 clean:
 	@rm -rf $(PLAYGROUND)

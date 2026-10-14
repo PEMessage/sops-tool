@@ -47,7 +47,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -357,7 +357,7 @@ async def _sops_in_place(
         str(path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, **env} if env else None,
+        env=_child_env(env),
     )
     _stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -365,23 +365,73 @@ async def _sops_in_place(
     return None
 
 
-def _age_key_env(key_files: Sequence[str]) -> tuple[dict[str, str] | None, Path | None]:
-    """Turn repeated `--age-key-file`s into a `SOPS_AGE_KEY_FILE` env var.
+def _age_key_env(paths: Sequence[Path]) -> tuple[dict[str, str] | None, Path | None]:
+    """Turn `--age-key-file`s into a `SOPS_AGE_KEY_FILE` env var.
 
     sops only reads a single identity file, so several are concatenated into a
     temporary one. Returns ``(env, temporary_file)``.
     """
-    if not key_files:
+    if not paths:
         return None, None
-    paths = [Path(name).expanduser() for name in key_files]
     if len(paths) == 1:
-        return {"SOPS_AGE_KEY_FILE": str(paths[0].resolve())}, None
+        return {"SOPS_AGE_KEY_FILE": str(paths[0])}, None
     text = "".join(path.read_text(encoding="utf-8") for path in paths)
     handle = tempfile.NamedTemporaryFile("w", prefix="sops-tool-age-", suffix=".txt", delete=False)
     handle.write(text)
     handle.close()
     temporary = Path(handle.name)
     return {"SOPS_AGE_KEY_FILE": str(temporary)}, temporary
+
+
+def _child_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
+    return {**os.environ, **env} if env else None
+
+
+def _age_recipients(paths: Sequence[Path]) -> set[str]:
+    """The age public keys available to decrypt with, from the identity files."""
+    sources = list(paths)
+    if not sources:
+        env_file = os.environ.get("SOPS_AGE_KEY_FILE")
+        if env_file:
+            sources.append(Path(env_file).expanduser())
+    recipients: set[str] = set()
+    for path in sources:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        recipients.update(re.findall(r"#\s*public key:\s*(age1[0-9a-z]+)", text))
+    return recipients
+
+
+def _key_labels(config: "Config", actual: set[Key] | None, available: set[str]) -> list[str]:
+    """The names of the keys that (can) decrypt a file, for display."""
+    if not actual:
+        return []
+    labels = [
+        config.key_names.get((backend, ident), ident)
+        for backend, ident in actual
+        if backend == "age" and ident in available
+    ]
+    return sorted(labels)
+
+
+async def _sops_decrypts(
+    config: "Config", sops: str, path: Path, env: Mapping[str, str] | None = None
+) -> bool:
+    """Whether sops can decrypt the file with the available keys (read-only)."""
+    proc = await asyncio.create_subprocess_exec(
+        sops,
+        "--config",
+        str(config.path),
+        "--decrypt",
+        str(path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=_child_env(env),
+    )
+    await proc.communicate()
+    return proc.returncode == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -871,42 +921,47 @@ class DecryptCommand(Subcommand):
 
         color = sys.stdout.isatty()
         width = max(len(state) for state in DECRYPT_COLOR)
-        acted = errors = 0
+        acted = 0
 
-        env, temporary = _age_key_env(args.age_key_file)
+        key_files = [_resolve(name, args) for name in args.age_key_file]
+        for key_file in key_files:
+            if not key_file.is_file():
+                print(f"sops-tool: age key file not found: {key_file}", file=sys.stderr)
+                return 2
+        env, temporary = _age_key_env(key_files)
+        available = _age_recipients(key_files)
         try:
             for path, _rule in matches:
                 display = _display(config, path, args)
                 encrypted, error = await filestatus(path, sops)
+                if error is not None or not encrypted:
+                    continue  # unreadable, or already plaintext: nothing to do
 
-                if error is not None and _is_read_error(error):
-                    _emit_state(color, width, DECRYPT_COLOR, "error", display, error)
-                    errors += 1
-                    continue
-                if not encrypted:
-                    continue  # already plaintext
+                # Read the keys before decrypting: afterwards the sops block is gone.
+                actual = await asyncio.to_thread(_actual_keys, path)
+                labels = " ".join(_key_labels(config, actual, available)) or None
+
                 if args.dry_run:
-                    _emit_state(color, width, DECRYPT_COLOR, "would decrypt", display)
-                    acted += 1
+                    if await _sops_decrypts(config, sops, path, env):
+                        _emit_state(color, width, DECRYPT_COLOR, "would decrypt", display, labels)
+                        acted += 1
                     continue
+
                 if args.interactive and not await _confirm("decrypt", display):
                     _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
                     continue
 
-                failure = await _sops_in_place(config, sops, "decrypt", path, env)
-                if failure is None:
-                    _emit_state(color, width, DECRYPT_COLOR, "decrypted", display)
+                # Only report files we could actually decrypt with these keys.
+                if await _sops_in_place(config, sops, "decrypt", path, env) is None:
+                    _emit_state(color, width, DECRYPT_COLOR, "decrypted", display, labels)
                     acted += 1
-                else:
-                    _emit_state(color, width, DECRYPT_COLOR, "error", display, failure)
-                    errors += 1
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
-        if acted == 0 and errors == 0:
+        if acted == 0:
             print("nothing to decrypt")
-        return 1 if errors else 0
+        return 0
 
 
 # --------------------------------------------------------------------------- #
