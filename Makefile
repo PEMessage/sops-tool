@@ -42,17 +42,27 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 
 	printf '%s\n' \
 		'# Sample config. Rules are tried in order; the first match wins.' \
+		'# The `keys:` map names keys: sops ignores it, easy-sops reads the' \
+		'# names (via the map and the &anchors) and labels keys by name.' \
+		'keys:' \
+		'  admin: &admin __RECIPIENT__' \
+		'  backup: &backup __RECIPIENT2__' \
+		'' \
 		'creation_rules:' \
 		'  - path_regex: ^secrets/prod\.yaml$$' \
-		'    age: __RECIPIENT__' \
+		'    age: *admin' \
 		'  - path_regex: ^secrets/' \
-		'    age: __RECIPIENT__,__RECIPIENT2__' \
+		'    age:' \
+		'      - *admin' \
+		'      - *backup' \
 		'  - path_regex: \.yaml$$' \
-		'    age: __RECIPIENT__' \
+		'    age: *admin' \
 		'  - path_regex: ^data/' \
-		'    age: __RECIPIENT__' \
+		'    age: *admin' \
 		'  - path_regex: ^kek/' \
-		'    age: __RECIPIENT__,__RECIPIENT2__' \
+		'    age:' \
+		'      - *admin' \
+		'      - *backup' \
 		> $(PLAYGROUND)/.sops.yaml
 	sed -i -e "s|__RECIPIENT2__|$$recipient2|g" -e "s|__RECIPIENT__|$$recipient|g" $(PLAYGROUND)/.sops.yaml
 
@@ -115,7 +125,7 @@ $(STAMP): $(EASY_SOPS) $(MAKEFILE_LIST)
 	$(SOPS) --config $(PLAYGROUND)/.sops.yaml --age "$$recipient,$$recipient2" --encrypt --in-place $(PLAYGROUND)/app/extra-key.yaml
 
 	touch $(STAMP)
-	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml, data/blob.bin' '  kek (covered):   kek/age.txt, kek/age2.txt (the sops age keys)' '  not matched:     notes.txt' '  error:           data/broken.yaml (unreadable symlink)' '' 'try: make demo'
+	printf '%s\n' '' 'playground ready in ./$(PLAYGROUND)/' '  named keys:      admin, backup (from .sops.yaml anchors)' '  encrypted:       secrets/prod.yaml, config/db.yaml' '  multi-key:       secrets/dev.yaml (two keys)' '  need updatekeys: secrets/missing-key.yaml (missing an expected key)' '  need rotate:     app/extra-key.yaml (has an extra key)' '  not encrypted:   secrets/extra.yaml, app/settings.yaml, deploy/prod/values.yaml, data/blob.bin' '  kek (covered):   kek/age.txt, kek/age2.txt (the sops age keys)' '  not matched:     notes.txt' '  error:           data/broken.yaml (unreadable symlink)' '' 'try: make demo'
 
 playground: $(STAMP)
 

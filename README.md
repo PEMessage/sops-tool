@@ -35,23 +35,36 @@ with a coloured state word, and paths relative to the current directory. Each
 line also names the master key(s), compared against the keys the matching rule
 expects.
 
-sops keys have no human name, so each distinct key gets a short **pronoun** of
-the form `<backend>~<index>`, and the pronouns are defined at the top of the
-output. The keys are shown like a diff against `.sops.yaml`: white means the key
-matches, a green `+` is a key `.sops.yaml` has but the file lacks, and a red `-`
-is a key the file has but `.sops.yaml` does not:
+A key can be given a human name in `.sops.yaml`, either through a top-level
+`keys:` map (which sops ignores) or a YAML anchor, and referenced by alias:
+
+```yaml
+keys:
+  admin: &admin age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+creation_rules:
+  - path_regex: ^secrets/
+    age: *admin
+```
+
+`status` labels a named key by that name; a key without one gets a short
+**pronoun** of the form `<backend>~<index>`. Either way the keys in play are
+defined at the top of the output. The keys are then shown like a diff against
+`.sops.yaml`: white means the key matches, a green `+` is a key `.sops.yaml` has
+but the file lacks, and a red `-` is a key the file has but `.sops.yaml` does
+not:
 
 ```console
 $ easy-sops status --branch
-age~0: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+admin:  age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+backup: age1ck8af8dr5yq3j8sea5jxg58vvjmth6m80gq5tf2n09ztfqfrxd0stl8awd
 
 ## /repo
-encrypted        config/db.yaml            age~0
-encrypted        secrets/dev.yaml          age~0 age~1
-not encrypted    secrets/extra.yaml        +age~0 +age~1
-not encrypted    kek/age.txt               +age~0 +age~1
-need updatekeys  secrets/missing-key.yaml  +age~0 age~1
-need rotate      app/extra-key.yaml        -age~0 age~1
+encrypted        config/db.yaml            admin
+encrypted        secrets/dev.yaml          admin backup
+not encrypted    secrets/extra.yaml        +admin +backup
+not encrypted    kek/age.txt               +admin +backup
+need updatekeys  secrets/missing-key.yaml  +backup admin
+need rotate      app/extra-key.yaml        -backup admin
 error            data/broken.yaml          ?  <sops filestatus message>
 ```
 
@@ -75,9 +88,9 @@ paths:
 
 ```console
 $ easy-sops status -- secrets config
-encrypted        secrets/dev.yaml          age~0 age~1
-not encrypted    secrets/extra.yaml        +age~0 +age~1
-need updatekeys  secrets/missing-key.yaml  +age~0 age~1
+encrypted        secrets/dev.yaml          admin backup
+not encrypted    secrets/extra.yaml        +admin +backup
+need updatekeys  secrets/missing-key.yaml  +backup admin
 ```
 
 Machine-readable output mirrors `git status --porcelain`: one `<code>\t<path>`

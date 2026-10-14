@@ -44,7 +44,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -137,10 +137,16 @@ class Rule:
 class Config:
     """The parsed `.sops.yaml`, and the root every command works from."""
 
-    def __init__(self, path: Path, rules: Sequence[Rule]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        rules: Sequence[Rule],
+        key_names: Mapping[Key, str] | None = None,
+    ) -> None:
         self.path = Path(path).resolve()
         self.root = self.path.parent
         self.rules = tuple(rules)
+        self.key_names = dict(key_names or {})
 
     # -- construction ------------------------------------------------------- #
     @classmethod
@@ -156,8 +162,11 @@ class Config:
     @classmethod
     async def load(cls, path: Path) -> "Config":
         path = Path(path).resolve()
-        raw = await asyncio.to_thread(_read_config, path)
-        return cls(path, _parse_rules(path, raw.get("creation_rules")))
+        text = await asyncio.to_thread(_read_text, path)
+        data = _parse_config(path, text)
+        rules = _parse_rules(path, data.get("creation_rules"))
+        key_names = _rule_key_names(rules, _raw_key_names(text, data))
+        return cls(path, rules, key_names)
 
     # -- queries ------------------------------------------------------------ #
     def relative(self, path: Path) -> str:
@@ -189,14 +198,66 @@ def _find_config(directory: Path) -> Path | None:
     return None
 
 
-def _read_config(path: Path) -> Mapping[str, Any]:
+def _read_text(path: Path) -> str:
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
-    if not isinstance(raw, Mapping):
+
+
+def _parse_config(path: Path, text: str) -> Mapping[str, Any]:
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"cannot parse {path}: {exc}") from exc
+    if not isinstance(data, Mapping):
         raise ConfigError(f"{path}: expected a YAML mapping at the top level")
-    return raw
+    return data
+
+
+def _raw_key_names(text: str, data: Mapping[str, Any]) -> dict[str, str]:
+    """Map a key's raw value to its name, from the `keys:` map and YAML anchors.
+
+    Both of these let a `.sops.yaml` give keys human names::
+
+        keys:
+          admin: &admin age1...
+        creation_rules:
+          - age: *admin
+    """
+    names: dict[str, str] = {}
+    keys_section = data.get("keys")
+    if isinstance(keys_section, Mapping):
+        for name, value in keys_section.items():
+            for raw in _as_list(value):
+                names.setdefault(raw, str(name))
+    try:
+        for event in yaml.parse(text):
+            if isinstance(event, yaml.ScalarEvent) and event.anchor and event.value is not None:
+                names.setdefault(event.value, event.anchor)
+    except yaml.YAMLError:
+        pass
+    return names
+
+
+def _iter_rule_keys(fields: Mapping[str, Any]) -> Iterator[tuple[str, str]]:
+    """Yield `(backend, raw_value)` for every key a rule references."""
+    for backend in BACKENDS:
+        for raw in _as_list(fields.get(backend)):
+            yield backend, raw
+    for group in fields.get("key_groups") or []:
+        if isinstance(group, Mapping):
+            yield from _iter_rule_keys(group)
+
+
+def _rule_key_names(rules: Sequence[Rule], raw_names: Mapping[str, str]) -> dict[Key, str]:
+    names: dict[Key, str] = {}
+    for rule in rules:
+        for backend, raw in _iter_rule_keys(rule.fields):
+            name = raw_names.get(raw)
+            if name:
+                names.setdefault((backend, _normalize_key(backend, raw)), name)
+    return names
 
 
 def _parse_rules(config: Path, raw: Any) -> list[Rule]:
@@ -530,7 +591,7 @@ class StatusCommand(Subcommand):
                 print(f"{PORCELAIN_CODE[entry.state]}\t{entry.path}")
             return 0
 
-        _print_status(entries, config.root if args.branch else None)
+        _print_status(entries, config.key_names, config.root if args.branch else None)
         return 0
 
 
@@ -581,36 +642,42 @@ def _status_entry(
     return StatusEntry(display, state, actual, expected, extra, missing, False, None)
 
 
-def _key_tokens(entry: StatusEntry, pronouns: Mapping[Key, str]) -> list[tuple[str, str | None]]:
+def _key_tokens(entry: StatusEntry, labels: Mapping[Key, str]) -> list[tuple[str, str | None]]:
     """Diff the file's keys against the rule's: white same, green `+` extra, red `-` missing."""
     if entry.unknown:
         return [("?", None)]
     tokens: list[tuple[str, str | None]] = []
-    for key in sorted(entry.keys | entry.expected):
-        pronoun = pronouns[key]
+    for key in sorted(entry.keys | entry.expected, key=lambda key: labels.get(key, key[1])):
+        label = labels.get(key, key[1])
         if key in entry.keys and key in entry.expected:
-            tokens.append((pronoun, None))  # matches .sops.yaml -> white
+            tokens.append((label, None))  # matches .sops.yaml -> white
         elif key in entry.expected:
-            tokens.append((f"+{pronoun}", "green"))  # .sops.yaml has it, file lacks it
+            tokens.append((f"+{label}", "green"))  # .sops.yaml has it, file lacks it
         else:
-            tokens.append((f"-{pronoun}", "red"))  # file has it, .sops.yaml lacks it
+            tokens.append((f"-{label}", "red"))  # file has it, .sops.yaml lacks it
     return tokens or [("-", None)]
 
 
-def _print_status(entries: Sequence[StatusEntry], branch_root: Path | None = None) -> None:
-    pronouns = _pronouns(key for entry in entries for key in entry.keys | entry.expected)
+def _print_status(
+    entries: Sequence[StatusEntry],
+    key_names: Mapping[Key, str],
+    branch_root: Path | None = None,
+) -> None:
+    all_keys = {key for entry in entries for key in entry.keys | entry.expected}
+    pronouns = _pronouns(key for key in all_keys if key not in key_names)
+    labels = {key: key_names.get(key) or pronouns[key] for key in all_keys}
 
-    if pronouns:
-        # Unnamed keys get a `backend~index` pronoun; define them up top.
-        for key in sorted(pronouns):
-            print(f"{pronouns[key]}: {key[1]}")
+    if labels:
+        # Named keys keep their name; unnamed ones get a `backend~index` pronoun.
+        for key in sorted(all_keys, key=lambda key: labels[key]):
+            print(f"{labels[key]}: {key[1]}")
         print()
 
     if branch_root is not None:
         print(f"## {branch_root}")
 
     color = sys.stdout.isatty()
-    tokens = [_key_tokens(entry, pronouns) for entry in entries]
+    tokens = [_key_tokens(entry, labels) for entry in entries]
     plain_keys = [" ".join(text for text, _shade in row) for row in tokens]
     width_path = max((len(entry.path) for entry in entries), default=0)
     width_keys = max((len(text) for text in plain_keys if text != "-"), default=0)
