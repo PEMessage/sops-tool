@@ -24,7 +24,13 @@ plumbing
 porcelain
   status     report whether matched files are encrypted
   encrypt    encrypt matched, not-yet-encrypted files in place
-  decrypt    decrypt matched, still-encrypted files in place
+  decrypt    decrypt the matched files the given keys can open
+
+`status` and `decrypt` share one view over the repository: every matched file,
+its keys, and whether one of *your* keys opens it. `status` counts only the
+`--age-key-file`s you name (never the ambient environment, so it is
+deterministic); `decrypt` also honours `SOPS_AGE_KEY*` (what sops actually
+uses) and, beyond showing the view, decrypts the files a key matched.
 
 Commands accept `--` before paths, like git: `sops-tool status -- secrets/`.
 Paths are printed relative to the current directory by default; pass
@@ -47,7 +53,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -82,6 +88,7 @@ STATE_PLAIN = "not encrypted"
 STATE_UPDATEKEYS = "need updatekeys"
 STATE_ROTATE = "need rotate"
 STATE_ERROR = "error"
+STATE_DECRYPTED = "decrypted"
 
 STATE_COLOR = {
     STATE_ENCRYPTED: "green",  # no drift
@@ -89,6 +96,7 @@ STATE_COLOR = {
     STATE_UPDATEKEYS: "yellow",  # pure-plus drift: encryption has an extra key
     STATE_ROTATE: "yellow",  # minus drift: an expected key is missing
     STATE_ERROR: "red",
+    STATE_DECRYPTED: "green",
 }
 PORCELAIN_CODE = {
     STATE_ENCRYPTED: "E",
@@ -96,10 +104,17 @@ PORCELAIN_CODE = {
     STATE_UPDATEKEYS: "+",
     STATE_ROTATE: "-",
     STATE_ERROR: "!",
+    STATE_DECRYPTED: "D",
 }
 LABEL_WIDTH = max(len(state) for state in STATE_COLOR)
 
-ANSI = {"reset": "\033[0m", "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m"}
+ANSI = {
+    "reset": "\033[0m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "orange": "\033[38;5;208m",
+}
 
 
 class ConfigError(Exception):
@@ -387,10 +402,14 @@ def _child_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
     return {**os.environ, **env} if env else None
 
 
-def _age_recipients(paths: Sequence[Path]) -> set[str]:
-    """The age public keys available to decrypt with, from the identity files."""
+def _age_recipients(paths: Sequence[Path], include_env: bool = False) -> set[str]:
+    """The age public keys available to decrypt with, from the identity files.
+
+    The `SOPS_AGE_KEY_FILE` environment is only consulted when *include_env* is
+    set, so `status` stays unaffected by the ambient environment.
+    """
     sources = list(paths)
-    if not sources:
+    if include_env:
         env_file = os.environ.get("SOPS_AGE_KEY_FILE")
         if env_file:
             sources.append(Path(env_file).expanduser())
@@ -404,41 +423,8 @@ def _age_recipients(paths: Sequence[Path]) -> set[str]:
     return recipients
 
 
-def _key_labels(config: "Config", actual: set[Key] | None, available: set[str]) -> list[str]:
-    """The names of the keys that (can) decrypt a file, for display."""
-    if not actual:
-        return []
-    labels = [
-        config.key_names.get((backend, ident), ident)
-        for backend, ident in actual
-        if backend == "age" and ident in available
-    ]
-    return sorted(labels)
-
-
-def _no_match_tokens(config: "Config", actual: set[Key] | None) -> list[tuple[str, str | None]]:
-    """`-key` tokens for the keys a file needs, when none of them is available."""
-    if not actual:
-        return []
-    return [(f"-{config.key_names.get(key, key[1])}", "red") for key in sorted(actual)]
-
-
-async def _sops_decrypts(
-    config: "Config", sops: str, path: Path, env: Mapping[str, str] | None = None
-) -> bool:
-    """Whether sops can decrypt the file with the available keys (read-only)."""
-    proc = await asyncio.create_subprocess_exec(
-        sops,
-        "--config",
-        str(config.path),
-        "--decrypt",
-        str(path),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-        env=_child_env(env),
-    )
-    await proc.communicate()
-    return proc.returncode == 0
+def _available_age_keys(key_files: Sequence[Path], include_env: bool = False) -> set[Key]:
+    return {("age", recipient) for recipient in _age_recipients(key_files, include_env)}
 
 
 # --------------------------------------------------------------------------- #
@@ -542,6 +528,14 @@ def _resolve(raw: str, args: argparse.Namespace) -> Path:
     if not path.is_absolute() and args.directory:
         path = Path(args.directory) / path
     return path.resolve()
+
+
+def _resolve_key_files(args: argparse.Namespace) -> list[Path]:
+    key_files = [_resolve(name, args) for name in args.age_key_file]
+    for key_file in key_files:
+        if not key_file.is_file():
+            raise ConfigError(f"age key file not found: {key_file}")
+    return key_files
 
 
 def _display(config: Config, path: Path, args: argparse.Namespace) -> str:
@@ -669,12 +663,19 @@ class StatusCommand(Subcommand):
         parser.add_argument(
             "--porcelain",
             action="store_true",
-            help="machine-readable output: '<E|U|!>\\t<path>'",
+            help="machine-readable output: '<code>\\t<path>'",
         )
         parser.add_argument(
             "--full-name",
             action="store_true",
             help="show paths relative to the repository root",
+        )
+        parser.add_argument(
+            "--age-key-file",
+            action="append",
+            default=[],
+            metavar="FILE",
+            help="age identity file whose keys are marked/checked (repeatable)",
         )
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
@@ -684,31 +685,21 @@ class StatusCommand(Subcommand):
             return 127
 
         roots = [_resolve(path, args) for path in args.paths]
-        matches = [entry async for entry in config.files(roots)]
+        key_files = _resolve_key_files(args)
 
-        limit = asyncio.Semaphore(MAX_CONCURRENCY)
-
-        async def inspect(path: Path) -> tuple[bool | None, str | None, set[Key] | None]:
-            async with limit:
-                encrypted, error = await filestatus(path, sops)
-                actual = None
-                if error is None and encrypted:
-                    actual = await asyncio.to_thread(_actual_keys, path)
-            return encrypted, error, actual
-
-        results = await asyncio.gather(*(inspect(path) for path, _rule in matches))
-
-        entries = [
-            _status_entry(config, path, rule, encrypted, error, actual, args)
-            for (path, rule), (encrypted, error, actual) in zip(matches, results)
-        ]
+        entries = await _collect_entries(config, roots, sops, args)
 
         if args.porcelain:
             for entry in entries:
                 print(f"{PORCELAIN_CODE[entry.state]}\t{entry.path}")
             return 0
 
-        _print_status(entries, config.key_names, config.root if args.branch else None)
+        _print_report(
+            entries,
+            config.key_names,
+            _available_age_keys(key_files),
+            config.root if args.branch else None,
+        )
         return 0
 
 
@@ -724,6 +715,7 @@ class StatusEntry:
     missing: set[Key]
     unknown: bool
     error: str | None
+    source: Path
 
 
 def _status_entry(
@@ -739,13 +731,13 @@ def _status_entry(
     display = _display(config, path, args)
 
     if error is not None and _is_read_error(error):
-        return StatusEntry(display, STATE_ERROR, set(), expected, set(), set(), True, error)
+        return StatusEntry(display, STATE_ERROR, set(), expected, set(), set(), True, error, path)
     if error is not None or not encrypted:
         # sops could not parse the file, or it simply is not encrypted: either
         # way it is not a sops document, so report it as plaintext.
-        return StatusEntry(display, STATE_PLAIN, set(), expected, set(), set(expected), False, None)
+        return StatusEntry(display, STATE_PLAIN, set(), expected, set(), set(expected), False, None, path)
     if actual is None:
-        return StatusEntry(display, STATE_ENCRYPTED, set(), expected, set(), set(), True, None)
+        return StatusEntry(display, STATE_ENCRYPTED, set(), expected, set(), set(), True, None, path)
 
     extra, missing = actual - expected, expected - actual
     if extra:
@@ -756,7 +748,29 @@ def _status_entry(
         state = STATE_UPDATEKEYS
     else:
         state = STATE_ENCRYPTED
-    return StatusEntry(display, state, actual, expected, extra, missing, False, None)
+    return StatusEntry(display, state, actual, expected, extra, missing, False, None, path)
+
+
+async def _collect_entries(
+    config: Config, roots: Sequence[Path], sops: str, args: argparse.Namespace
+) -> list[StatusEntry]:
+    """Inspect every matched file once, for both `status` and `decrypt`."""
+    matches = [entry async for entry in config.files(roots)]
+    limit = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def inspect(path: Path) -> tuple[bool | None, str | None, set[Key] | None]:
+        async with limit:
+            encrypted, error = await filestatus(path, sops)
+            actual = None
+            if error is None and encrypted:
+                actual = await asyncio.to_thread(_actual_keys, path)
+        return encrypted, error, actual
+
+    results = await asyncio.gather(*(inspect(path) for path, _rule in matches))
+    return [
+        _status_entry(config, path, rule, encrypted, error, actual, args)
+        for (path, rule), (encrypted, error, actual) in zip(matches, results)
+    ]
 
 
 def _key_tokens(entry: StatusEntry, labels: Mapping[Key, str]) -> list[tuple[str, str | None]]:
@@ -775,36 +789,51 @@ def _key_tokens(entry: StatusEntry, labels: Mapping[Key, str]) -> list[tuple[str
     return tokens or [("-", None)]
 
 
-def _print_status(
+def _print_report(
     entries: Sequence[StatusEntry],
     key_names: Mapping[Key, str],
+    available: set[Key],
     branch_root: Path | None = None,
 ) -> None:
-    all_keys = {key for entry in entries for key in entry.keys | entry.expected}
+    all_keys = {key for entry in entries for key in entry.keys | entry.expected} | set(available)
     pronouns = _pronouns(key for key in all_keys if key not in key_names)
     labels = {key: key_names.get(key) or pronouns[key] for key in all_keys}
+    color = sys.stdout.isatty()
 
     if labels:
-        # Named keys keep their name; unnamed ones get a `backend~index` pronoun.
+        # Named keys keep their name; unnamed ones get a `backend~index` pronoun;
+        # the keys we can decrypt with are highlighted.
         for key in sorted(all_keys, key=lambda key: labels[key]):
-            print(f"{labels[key]}: {key[1]}")
+            shade = "orange" if key in available else None
+            print(_paint(f"{labels[key]}: {key[1]}", shade, color))
         print()
 
     if branch_root is not None:
         print(f"## {branch_root}")
 
-    color = sys.stdout.isatty()
     tokens = [_key_tokens(entry, labels) for entry in entries]
+    unlocked = [
+        [key for key in sorted(entry.keys, key=lambda key: labels[key]) if key in available]
+        for entry in entries
+    ]
     plain_keys = [" ".join(text for text, _shade in row) for row in tokens]
+    plain_unlocked = [" ".join(f"*{labels[key]}" for key in row) for row in unlocked]
     width_path = max((len(entry.path) for entry in entries), default=0)
     width_keys = max((len(text) for text in plain_keys if text != "-"), default=0)
+    width_unlocked = max((len(text) for text in plain_unlocked), default=0)
 
-    for entry, row, plain in zip(entries, tokens, plain_keys):
+    for entry, row, plain, keys_used, match_plain in zip(
+        entries, tokens, plain_keys, unlocked, plain_unlocked
+    ):
         label = _paint(entry.state.ljust(LABEL_WIDTH), STATE_COLOR[entry.state], color)
         line = f"{label}  {entry.path.ljust(width_path)}"
         if width_keys:
-            colored = " ".join(_paint(text, shade, color) if shade else text for text, shade in row)
+            colored = _paint_tokens(row, color)
             line += f"  {colored}{' ' * (width_keys - len(plain))}"
+        if width_unlocked:
+            # Last column: a `*name` for each of our keys that opens this file.
+            match = " ".join(_paint(f"*{labels[key]}", "orange", color) for key in keys_used)
+            line += f"  {match}{' ' * (width_unlocked - len(match_plain))}"
         line = line.rstrip()
         if entry.error is not None:
             line += f"  {entry.error}"
@@ -814,17 +843,30 @@ def _print_status(
 # --------------------------------------------------------------------------- #
 # porcelain: encrypt / decrypt
 # --------------------------------------------------------------------------- #
+async def _decrypt_entries(
+    config: Config,
+    entries: Sequence[StatusEntry],
+    sops: str,
+    env: Mapping[str, str] | None,
+    available: set[Key],
+    args: argparse.Namespace,
+) -> None:
+    """Decrypt, in place, every entry one of our own keys opens."""
+    decryptable = {STATE_ENCRYPTED, STATE_UPDATEKEYS, STATE_ROTATE}
+    for entry in entries:
+        if entry.state not in decryptable or not entry.keys & available:
+            continue
+        if args.interactive and not await _confirm("decrypt", entry.path):
+            continue
+        if await _sops_in_place(config, sops, "decrypt", entry.source, env) is None:
+            entry.state = STATE_DECRYPTED
+
+
 ENCRYPT_COLOR = {
     "encrypted": "green",
     "would encrypt": "yellow",
     "skipped": None,
     "error": "red",
-}
-DECRYPT_COLOR = {
-    "decrypted": "green",
-    "would decrypt": "yellow",
-    "key no match": "red",
-    "skipped": None,
 }
 
 
@@ -928,54 +970,19 @@ class DecryptCommand(Subcommand):
             return 127
 
         roots = [_resolve(path, args) for path in args.paths]
-        matches = [entry async for entry in config.files(roots)]
-
-        color = sys.stdout.isatty()
-        width = max(len(state) for state in DECRYPT_COLOR)
-        shown = 0
-
-        key_files = [_resolve(name, args) for name in args.age_key_file]
-        for key_file in key_files:
-            if not key_file.is_file():
-                print(f"sops-tool: age key file not found: {key_file}", file=sys.stderr)
-                return 2
+        key_files = _resolve_key_files(args)
         env, temporary = _age_key_env(key_files)
-        available = _age_recipients(key_files)
+        available = _available_age_keys(key_files, include_env=True)
         try:
-            for path, _rule in matches:
-                display = _display(config, path, args)
-                encrypted, error = await filestatus(path, sops)
-                if error is not None or not encrypted:
-                    continue  # unreadable, or already plaintext: nothing to do
-
-                # Read the keys before decrypting: afterwards the sops block is gone.
-                actual = await asyncio.to_thread(_actual_keys, path)
-
-                if args.dry_run:
-                    decrypted = await _sops_decrypts(config, sops, path, env)
-                else:
-                    if args.interactive and not await _confirm("decrypt", display):
-                        _emit_state(color, width, DECRYPT_COLOR, "skipped", display)
-                        shown += 1
-                        continue
-                    decrypted = await _sops_in_place(config, sops, "decrypt", path, env) is None
-
-                if decrypted:
-                    state = "would decrypt" if args.dry_run else "decrypted"
-                    tokens = [(label, None) for label in _key_labels(config, actual, available)]
-                else:
-                    # No key of ours opens it: like `status`, show the keys it needs.
-                    state = "key no match"
-                    tokens = _no_match_tokens(config, actual)
-
-                _emit_state(color, width, DECRYPT_COLOR, state, display, _paint_tokens(tokens, color))
-                shown += 1
+            entries = await _collect_entries(config, roots, sops, args)
+            if not args.dry_run:
+                await _decrypt_entries(config, entries, sops, env, available, args)
+            # The very same view as `status`: `decrypt -n` with no key files *is*
+            # `status`, and a `*name` marks a file one of our keys opened.
+            _print_report(entries, config.key_names, available)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-
-        if shown == 0:
-            print("nothing to decrypt")
         return 0
 
 
@@ -1006,10 +1013,10 @@ def build_parser() -> argparse.ArgumentParser:
 async def run(args: argparse.Namespace) -> int:
     try:
         config = await Config.discover(Path(args.directory) if args.directory else None)
+        return await args.command.run(config, args)
     except ConfigError as exc:
         print(f"sops-tool: {exc}", file=sys.stderr)
         return 2
-    return await args.command.run(config, args)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
