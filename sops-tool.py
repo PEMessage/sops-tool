@@ -26,9 +26,9 @@ porcelain
   encrypt    encrypt matched, not-yet-encrypted files in place
   decrypt    decrypt matched files in place (a thin `sops` wrapper)
 
-`status` reports every matched file, its keys and its encryption state; with
-`--decrypt-check` it additionally highlights the keys you can decrypt with
-(`--age-key-file`, or `SOPS_AGE_KEY*`) and marks the files they open.
+`status` reports every matched file, its keys and its encryption state. With
+`--decrypt-check` it also runs `sops --decrypt` on each encrypted file and marks
+the ones that open with an orange `*` (naming the matching keys where it can).
 `decrypt` does not share that view: it is a thin wrapper that simply runs
 `sops --decrypt` on the matched files and reports what sops says.
 
@@ -53,7 +53,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -672,15 +672,16 @@ class StatusCommand(Subcommand):
         )
         parser.add_argument(
             "--decrypt-check",
+            "-d",
             action="store_true",
-            help="also mark which of your keys can decrypt each file",
+            help="try to decrypt each file and mark the ones that open",
         )
         parser.add_argument(
             "--age-key-file",
             action="append",
             default=[],
             metavar="FILE",
-            help="age identity file to check against (with --decrypt-check; repeatable)",
+            help="age identity file to check against (with --decrypt-check/-d; repeatable)",
         )
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
@@ -696,6 +697,8 @@ class StatusCommand(Subcommand):
         )
 
         entries = await _collect_entries(config, roots, sops, args)
+        if args.decrypt_check:
+            await _mark_decryptable(config, sops, entries, key_files)
 
         if args.porcelain:
             for entry in entries:
@@ -719,6 +722,7 @@ class StatusEntry:
     unknown: bool
     error: str | None
     source: Path
+    decryptable: bool = False
 
 
 def _status_entry(
@@ -776,6 +780,35 @@ async def _collect_entries(
     ]
 
 
+async def _mark_decryptable(
+    config: Config,
+    sops: str,
+    entries: Sequence[StatusEntry],
+    key_files: Sequence[Path],
+) -> None:
+    """Try `sops --decrypt` on every encrypted entry and flag the ones that open.
+
+    A key can reach sops in ways we cannot enumerate (inline `SOPS_AGE_KEY`, a
+    key command, a key service, …), so the only honest test is to ask sops.
+    """
+    decryptable = {STATE_ENCRYPTED, STATE_UPDATEKEYS, STATE_ROTATE}
+    env, temporary = _age_key_env(key_files)
+    limit = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def check(entry: StatusEntry) -> None:
+        if entry.state not in decryptable:
+            return
+        async with limit:
+            failure = await _run_sops(config, sops, "decrypt", entry.source, env, in_place=False)
+        entry.decryptable = failure is None
+
+    try:
+        await asyncio.gather(*(check(entry) for entry in entries))
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _key_tokens(entry: StatusEntry, labels: Mapping[Key, str]) -> list[tuple[str, str | None]]:
     """Diff the file's keys against the rule's: white same, green `+` extra, red `-` missing."""
     if entry.unknown:
@@ -815,28 +848,37 @@ def _print_report(
         print(f"## {branch_root}")
 
     tokens = [_key_tokens(entry, labels) for entry in entries]
-    unlocked = [
+    matched = [
         [key for key in sorted(entry.keys, key=lambda key: labels[key]) if key in available]
         for entry in entries
     ]
     plain_keys = [" ".join(text for text, _shade in row) for row in tokens]
-    plain_unlocked = [" ".join(f"*{labels[key]}" for key in row) for row in unlocked]
+    plain_match = [
+        " ".join(f"*{labels[key]}" for key in row) if row else ("*" if entry.decryptable else "")
+        for entry, row in zip(entries, matched)
+    ]
     width_path = max((len(entry.path) for entry in entries), default=0)
     width_keys = max((len(text) for text in plain_keys if text != "-"), default=0)
-    width_unlocked = max((len(text) for text in plain_unlocked), default=0)
+    width_match = max((len(text) for text in plain_match), default=0)
 
     for entry, row, plain, keys_used, match_plain in zip(
-        entries, tokens, plain_keys, unlocked, plain_unlocked
+        entries, tokens, plain_keys, matched, plain_match
     ):
         label = _paint(entry.state.ljust(LABEL_WIDTH), STATE_COLOR[entry.state], color)
         line = f"{label}  {entry.path.ljust(width_path)}"
         if width_keys:
             colored = _paint_tokens(row, color)
             line += f"  {colored}{' ' * (width_keys - len(plain))}"
-        if width_unlocked:
-            # Last column: a `*name` for each of our keys that opens this file.
-            match = " ".join(_paint(f"*{labels[key]}", "orange", color) for key in keys_used)
-            line += f"  {match}{' ' * (width_unlocked - len(match_plain))}"
+        if width_match:
+            # Last column: `*name` for each of our keys that opens this file —
+            # or a bare `*` when sops decrypts it through some other means.
+            if keys_used:
+                match = " ".join(_paint(f"*{labels[key]}", "orange", color) for key in keys_used)
+            elif entry.decryptable:
+                match = _paint("*", "orange", color)
+            else:
+                match = ""
+            line += f"  {match}{' ' * (width_match - len(match_plain))}"
         line = line.rstrip()
         if entry.error is not None:
             line += f"  {entry.error}"
