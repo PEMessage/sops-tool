@@ -35,12 +35,18 @@ porcelain
   status     report whether matched files are encrypted
   encrypt    encrypt matched, not-yet-encrypted files in place
   decrypt    decrypt matched files in place (a thin `sops` wrapper)
+  updatekeys reconcile matched files' keys with .sops.yaml
+  rotate     sync a file's keys and generate a fresh data key
 
 `status` reports every matched file, its keys and its encryption state. With
 `--decrypt-check` (`-d`) it also runs `sops --decrypt` on each encrypted file and
 marks the ones that open with an orange `*`, naming the matching keys where it
 can. `decrypt` does not share that view: it is a thin wrapper that simply runs
-`sops --decrypt` on the matched files and reports what sops says.
+`sops --decrypt` on the matched files and reports what sops says. `updatekeys`
+runs `sops updatekeys` on the files whose keys drifted from `.sops.yaml` — the
+`need updatekeys` ones by default, plus the `need rotate` ones with `--rotate`
+(sops updatekeys reconciles both directions). `rotate` is the heavier fix for the
+`need rotate` files: it syncs their keys and then rotates the data key.
 
 Commands accept `--` before paths, like git: `sops-tool status -- secrets/`.
 Paths are printed relative to the current directory by default; pass
@@ -60,11 +66,11 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Collection, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -150,8 +156,12 @@ UPDATEKEYS = State("need updatekeys", "yellow", "+")
 ROTATE = State("need rotate", "yellow", "-")
 ERROR = State("error", "red", "!")
 DECRYPTED = State("decrypted", "green", "D")
+UPDATEDKEYS = State("updated keys", "green")
+ROTATED = State("rotated", "green")
 WOULD_ENCRYPT = State("would encrypt", "yellow")
 WOULD_DECRYPT = State("would decrypt", "yellow")
+WOULD_UPDATEKEYS = State("would update", "yellow")
+WOULD_ROTATE = State("would rotate", "yellow")
 SKIPPED = State("skipped", None)
 
 # A file in one of these states has encrypted keys we might be able to open.
@@ -159,8 +169,9 @@ ENCRYPTED_STATES = (ENCRYPTED, UPDATEKEYS, ROTATE)
 
 # Every state shares one label width, so status and the action commands align.
 LABEL_WIDTH = max(len(state.label) for state in
-                  (ENCRYPTED, PLAIN, UPDATEKEYS, ROTATE, ERROR, DECRYPTED,
-                   WOULD_ENCRYPT, WOULD_DECRYPT, SKIPPED))
+                  (ENCRYPTED, PLAIN, UPDATEKEYS, ROTATE, ERROR, DECRYPTED, UPDATEDKEYS,
+                   ROTATED, WOULD_ENCRYPT, WOULD_DECRYPT, WOULD_UPDATEKEYS,
+                   WOULD_ROTATE, SKIPPED))
 
 
 @dataclass(frozen=True)
@@ -511,11 +522,20 @@ class Sops:
         env: Mapping[str, str] | None = None,
         in_place: bool = True,
     ) -> str | None:
-        """Run `sops --config … --<action> [--in-place] <path>`; return its error."""
-        command = [self.binary, "--config", str(config.path), f"--{action}"]
-        if in_place:
-            command.append("--in-place")
-        command.append(str(path))
+        """Run a sops write command; return its error message, or None on success.
+
+        `encrypt`/`decrypt` are global flags taking `--in-place`; `updatekeys` is
+        a subcommand that always rewrites the file and would otherwise prompt, so
+        it gets `--yes` (we do our own confirming).
+        """
+        if action == "updatekeys":
+            arguments = ["updatekeys", "--yes", str(path)]
+        else:
+            arguments = [f"--{action}"]
+            if in_place:
+                arguments.append("--in-place")
+            arguments.append(str(path))
+        command = [self.binary, "--config", str(config.path), *arguments]
         code, _stdout, stderr = await self._run(command, env)
         return None if code == 0 else _clean_error(stderr)
 
@@ -818,21 +838,36 @@ class Row:
     error: str | None = None
 
 
+def _drift_state(inspection: Inspection, expected: frozenset[Key]) -> State:
+    """The file's state once its keys are compared with the rule's.
+
+    `sops filestatus` alone only knows encrypted / not / error; `need updatekeys`
+    and `need rotate` come from diffing the file's actual keys against the rule's.
+    """
+    if inspection.state is ERROR:
+        return ERROR
+    if inspection.state is PLAIN:
+        return PLAIN  # not a sops document: it carries none of the rule's keys
+    if inspection.keys is None:
+        return ENCRYPTED  # encrypted, but its keys cannot be introspected
+    if inspection.keys - expected:
+        return ROTATE  # file has a key the rule lacks -> a red `-`
+    if expected - inspection.keys:
+        return UPDATEKEYS  # rule wants a key the file lacks -> a green `+`
+    return ENCRYPTED
+
+
 def _status_row(config: Config, path: Path, rule: Rule, inspection: Inspection,
                 args: argparse.Namespace) -> Row:
     expected = frozenset(rule.keys())
     display = _display(config, path, args)
-    if inspection.state is ERROR:
+    state = _drift_state(inspection, expected)
+    if state is ERROR:
         return Row(path, display, ERROR, expected, None, inspection.error)
-    if inspection.state is PLAIN:
-        # Not a sops document: it carries none of the rule's keys.
-        return Row(path, display, PLAIN, expected, frozenset())
-    if inspection.keys is None:
-        return Row(path, display, ENCRYPTED, expected, None)
-    extra = inspection.keys - expected
-    missing = expected - inspection.keys
-    state = ROTATE if extra else UPDATEKEYS if missing else ENCRYPTED
-    return Row(path, display, state, expected, inspection.keys)
+    keys = None if state is ENCRYPTED and inspection.keys is None else inspection.keys
+    if state is PLAIN:
+        keys = frozenset()
+    return Row(path, display, state, expected, keys)
 
 
 # --------------------------------------------------------------------------- #
@@ -901,33 +936,35 @@ class FileCommand(Subcommand):
 class ActionCommand(FileCommand):
     """A command that inspects each matched file and may change it in place.
 
-    The `encrypt`/`decrypt` loop lives here once: inspect, classify, then either
-    skip, report (dry-run), ask (interactive), or mutate. Subclasses only say
-    which state they act on and how.
+    The `encrypt`/`decrypt`/`updatekeys` loop lives here once: inspect, classify
+    (against the rule's keys, so `need updatekeys` and `need rotate` are just
+    states), then skip, report, ask, or mutate. Subclasses only say which states
+    they act on and how.
 
     `probe_dry_run` says whether `--dry-run` should *ask sops* (read-only) — true
     for `decrypt`, where only sops can say whether a key is at hand — or merely
-    predict (false for `encrypt`, where a matching rule is enough).
+    predict (false for `encrypt`/`updatekeys`, whose drift we already know).
     """
 
     verb: str
     would: State
     done: State
     probe_dry_run = False
+    nothing: str | None = None  # message when nothing matched; defaults to verb
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
         super().configure(parser)
         parser.add_argument(
             "-n", "--dry-run", action="store_true",
-            help=f"only show what would be {self.verb}ed",
+            help="only show what would change",
         )
         parser.add_argument(
             "-i", "--interactive", action="store_true",
-            help=f"confirm each file before {self.verb}ing",
+            help="confirm each file before changing it",
         )
 
-    def target(self, state: State) -> bool:
-        """Whether this command acts on a file in *state*."""
+    def target_states(self, args: argparse.Namespace) -> Collection[State]:
+        """The states this command acts on, given its options."""
         raise NotImplementedError
 
     def identity_environment(
@@ -950,10 +987,11 @@ class ActionCommand(FileCommand):
     async def run(self, config: Config, args: argparse.Namespace) -> int:
         sops = Sops.require()
         env, temporary = self.identity_environment(args)
+        targets = self.target_states(args)
         reporter = Reporter()
         acted = errors = 0
         try:
-            for path, _rule in await config.files(self.roots(args)):
+            for path, rule in await config.files(self.roots(args)):
                 display = _display(config, path, args)
                 inspection = await sops.inspect(path)
 
@@ -961,7 +999,8 @@ class ActionCommand(FileCommand):
                     reporter.outcome(ERROR, display, inspection.error)
                     errors += 1
                     continue
-                if not self.target(inspection.state):
+                state = _drift_state(inspection, frozenset(rule.keys()))
+                if state not in targets:
                     continue
                 if args.dry_run and not self.probe_dry_run:
                     reporter.outcome(self.would, display)
@@ -986,7 +1025,7 @@ class ActionCommand(FileCommand):
                     errors += 1
 
             if not acted and not errors:
-                print(f"nothing to {self.verb}")
+                print(self.nothing or f"nothing to {self.verb}")
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -1144,8 +1183,8 @@ class EncryptCommand(ActionCommand):
     would = WOULD_ENCRYPT
     done = ENCRYPTED
 
-    def target(self, state: State) -> bool:
-        return state is PLAIN
+    def target_states(self, args: argparse.Namespace) -> Collection[State]:
+        return {PLAIN}
 
     async def mutate(
         self,
@@ -1158,22 +1197,21 @@ class EncryptCommand(ActionCommand):
         return await sops.change(config, "encrypt", path)
 
 
-@subcommand
-class DecryptCommand(ActionCommand):
-    name = "decrypt"
-    help = "decrypt, in place, every matched file that is encrypted (a thin sops wrapper)"
+class AgeKeyAction(ActionCommand):
+    """An action whose sops command needs an age identity to unlock a data key.
 
-    verb = "decrypt"
-    would = WOULD_DECRYPT
-    done = DECRYPTED
-    probe_dry_run = True  # only sops can say whether a key is at hand
+    `decrypt`, `updatekeys` and `rotate` all take `--age-key-file`, hand the
+    identity to sops through `SOPS_AGE_KEY_FILE`, and run one sops command. They
+    differ only in *which* command and *which* states they act on, so the shared
+    plumbing lives here.
+    """
+
+    sops_action: str
+    key_file_help = "age identity file (repeatable)"
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
         super().configure(parser)
-        _add_age_key_file(parser, "age identity file to decrypt with (repeatable)")
-
-    def target(self, state: State) -> bool:
-        return state is ENCRYPTED
+        _add_age_key_file(parser, self.key_file_help)
 
     def identity_environment(
         self, args: argparse.Namespace
@@ -1188,7 +1226,81 @@ class DecryptCommand(ActionCommand):
         env: Mapping[str, str] | None,
         in_place: bool,
     ) -> str | None:
-        return await sops.change(config, "decrypt", path, env, in_place=in_place)
+        return await sops.change(config, self.sops_action, path, env, in_place=in_place)
+
+
+@subcommand
+class DecryptCommand(AgeKeyAction):
+    name = "decrypt"
+    help = "decrypt, in place, every matched file that is encrypted (a thin sops wrapper)"
+
+    verb = "decrypt"
+    would = WOULD_DECRYPT
+    done = DECRYPTED
+    probe_dry_run = True  # only sops can say whether a key is at hand
+    sops_action = "decrypt"
+
+    def target_states(self, args: argparse.Namespace) -> Collection[State]:
+        # Any encrypted file: decryption does not care about key drift.
+        return set(ENCRYPTED_STATES)
+
+
+@subcommand
+class UpdatekeysCommand(AgeKeyAction):
+    name = "updatekeys"
+    help = "reconcile matched files' keys with .sops.yaml (adds and removes)"
+
+    verb = "updatekeys"
+    would = WOULD_UPDATEKEYS
+    done = UPDATEDKEYS
+    nothing = "nothing to update"
+    sops_action = "updatekeys"
+
+    def configure(self, parser: argparse.ArgumentParser) -> None:
+        super().configure(parser)
+        parser.add_argument(
+            "--rotate", action="store_true",
+            help="also update files that carry a key .sops.yaml no longer lists",
+        )
+
+    def target_states(self, args: argparse.Namespace) -> Collection[State]:
+        states = {UPDATEKEYS}
+        if args.rotate:
+            states.add(ROTATE)  # `sops updatekeys` drops the stale keys too
+        return states
+
+
+@subcommand
+class RotateCommand(AgeKeyAction):
+    name = "rotate"
+    help = "re-key matched files: sync their keys and generate a new data key"
+
+    verb = "rotate"
+    would = WOULD_ROTATE
+    done = ROTATED
+    nothing = "nothing to rotate"
+    sops_action = "rotate"
+
+    def target_states(self, args: argparse.Namespace) -> Collection[State]:
+        return {ROTATE}
+
+    async def mutate(
+        self,
+        sops: Sops,
+        config: Config,
+        path: Path,
+        env: Mapping[str, str] | None,
+        in_place: bool,
+    ) -> str | None:
+        # `sops rotate` re-encrypts with the file's *existing* master keys, so on
+        # its own it would leave the `need rotate` drift in place. Rotating first
+        # (while the old key can still unlock the data key), then syncing keys,
+        # both re-keys and drops the stale ones — even when the stale key is the
+        # only one we hold.
+        failure = await sops.change(config, "rotate", path, env, in_place=in_place)
+        if failure is not None:
+            return failure
+        return await sops.change(config, "updatekeys", path, env)
 
 
 # --------------------------------------------------------------------------- #
