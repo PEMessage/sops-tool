@@ -253,6 +253,20 @@ All three need an age identity to unlock the data key, supplied with the same
 `--age-key-file` (repeatable) and `SOPS_AGE_KEY*` machinery as `decrypt`, and all
 take the usual `--` path filter and `-n/--dry-run` / `-i/--interactive`.
 
+Whether you actually hold a key cannot be read from the file's metadata, so
+`--dry-run` for `updatekeys`/`rotate` first **probes** with a read-only
+`sops --decrypt`: it prints `would update`/`would rotate`, or `can't update` /
+`can't rotate <reason>` when no key is at hand — never a `would …` that would not
+come true:
+
+```console
+$ sops-tool updatekeys -n -- secrets
+can't update     secrets/missing-key.yaml  but none were.
+
+$ sops-tool updatekeys -n --age-key-file keys/age.txt -- secrets
+would update     secrets/missing-key.yaml
+```
+
 Plumbing is stable and script-friendly:
 
 ```console

@@ -46,7 +46,10 @@ can. `decrypt` does not share that view: it is a thin wrapper that simply runs
 runs `sops updatekeys` on the `need updatekeys` files by default;
 `--include-need-rotate` also covers the `need rotate` ones, and `--do-rotate`
 additionally gives those a fresh data key. `rotate` is plain sops semantics: a
-new data key, with the recipient list left untouched.
+new data key, with the recipient list left untouched. Both need a key we cannot
+see from metadata, so their `--dry-run` probes with a read-only `sops --decrypt`
+and reports `can't update`/`can't rotate` (with sops's reason) when no key is at
+hand, rather than a `would …` that would not come true.
 
 Commands accept `--` before paths, like git: `sops-tool status -- secrets/`.
 Paths are printed relative to the current directory by default; pass
@@ -70,7 +73,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.23.0"
+__version__ = "0.24.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -162,6 +165,8 @@ WOULD_ENCRYPT = State("would encrypt", "yellow")
 WOULD_DECRYPT = State("would decrypt", "yellow")
 WOULD_UPDATEKEYS = State("would update", "yellow")
 WOULD_ROTATE = State("would rotate", "yellow")
+CANNOT_UPDATE = State("can't update", "red")
+CANNOT_ROTATE = State("can't rotate", "red")
 SKIPPED = State("skipped", None)
 
 # A file in one of these states has encrypted keys we might be able to open.
@@ -171,7 +176,7 @@ ENCRYPTED_STATES = (ENCRYPTED, UPDATEKEYS, ROTATE)
 LABEL_WIDTH = max(len(state.label) for state in
                   (ENCRYPTED, PLAIN, UPDATEKEYS, ROTATE, ERROR, DECRYPTED, UPDATEDKEYS,
                    ROTATED, WOULD_ENCRYPT, WOULD_DECRYPT, WOULD_UPDATEKEYS,
-                   WOULD_ROTATE, SKIPPED))
+                   WOULD_ROTATE, CANNOT_UPDATE, CANNOT_ROTATE, SKIPPED))
 
 
 @dataclass(frozen=True)
@@ -938,19 +943,20 @@ class ActionCommand(FileCommand):
 
     The `encrypt`/`decrypt`/`updatekeys`/`rotate` loop lives here once: inspect,
     classify (against the rule's keys, so `need updatekeys` and `need rotate` are
-    just states), then skip, report, ask, or change. A subclass only says *which
-    sops commands to run for a file in a given state* — that is `plan` — plus any
-    identity environment it needs.
+    just states), then skip, report, ask, or change. A subclass says *which sops
+    commands to run for a file in a given state* (`plan`), whether `--dry-run`
+    should first *ask sops* whether it even could (`probe`), and any identity
+    environment it needs.
 
-    `probe_dry_run` says whether `--dry-run` should *ask sops* (read-only) — true
-    for `decrypt`, where only sops can say whether a key is at hand — or merely
-    predict (false elsewhere, where the drift is already known from metadata).
+    `blocked` is the state shown when the change fails — or, on a probing
+    dry-run, when it could not even start (e.g. no key to unlock the data key);
+    it defaults to `error`.
     """
 
     verb: str
     would: State
     done: State
-    probe_dry_run = False
+    blocked: State = ERROR
     nothing: str | None = None  # message when nothing matched; defaults to verb
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
@@ -967,6 +973,15 @@ class ActionCommand(FileCommand):
     def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
         """The sops actions to run for a file in *state* (empty sequence = skip)."""
         raise NotImplementedError
+
+    def probe(self) -> str | None:
+        """A read-only sops action to test feasibility on `--dry-run`.
+
+        `None` means predict instead: the outcome is known from metadata alone
+        (e.g. `encrypt`), whereas `decrypt`/`updatekeys`/`rotate` need a key we
+        cannot see, so they probe with a read-only `sops --decrypt`.
+        """
+        return None
 
     def identity_environment(
         self, args: argparse.Namespace
@@ -991,31 +1006,32 @@ class ActionCommand(FileCommand):
                 actions = self.plan(_drift_state(inspection, frozenset(rule.keys())), args)
                 if not actions:
                     continue
-                if args.dry_run and not self.probe_dry_run:
-                    reporter.outcome(self.would, display)
-                    acted += 1
+
+                if args.dry_run:
+                    outcome = await self._dry_run(sops, config, path, env)
+                    if outcome is None:
+                        reporter.outcome(self.would, display)
+                        acted += 1
+                    else:
+                        reporter.outcome(self.blocked, display, outcome)
+                        errors += 1
                     continue
-                if not args.dry_run and args.interactive and not await _confirm(
-                    self.verb, display
-                ):
+
+                if args.interactive and not await _confirm(self.verb, display):
                     reporter.outcome(SKIPPED, display)
                     continue
 
-                # On a probing dry-run this is a read-only call; otherwise it
-                # really changes the file. Run the actions in order, stop at the
-                # first failure.
+                # Run the actions in order, stop at the first failure.
                 failure: str | None = None
                 for action in actions:
-                    failure = await sops.change(
-                        config, action, path, env, in_place=not args.dry_run
-                    )
+                    failure = await sops.change(config, action, path, env, in_place=True)
                     if failure is not None:
                         break
                 if failure is None:
-                    reporter.outcome(self.would if args.dry_run else self.done, display)
+                    reporter.outcome(self.done, display)
                     acted += 1
                 else:
-                    reporter.outcome(ERROR, display, failure)
+                    reporter.outcome(self.blocked, display, failure)
                     errors += 1
 
             if not acted and not errors:
@@ -1024,6 +1040,15 @@ class ActionCommand(FileCommand):
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         return 1 if errors else 0
+
+    async def _dry_run(
+        self, sops: Sops, config: Config, path: Path, env: Mapping[str, str] | None
+    ) -> str | None:
+        """Return None if the change would work, else the reason it could not."""
+        action = self.probe()
+        if action is None:
+            return None
+        return await sops.change(config, action, path, env, in_place=False)
 
 
 async def _confirm(verb: str, display: str) -> bool:
@@ -1209,7 +1234,10 @@ class DecryptCommand(AgeKeyAction):
     verb = "decrypt"
     would = WOULD_DECRYPT
     done = DECRYPTED
-    probe_dry_run = True  # only sops can say whether a key is at hand
+
+    def probe(self) -> str | None:
+        # A read-only `sops --decrypt`: if it fails, that is simply an error.
+        return "decrypt"
 
     def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
         # Any encrypted file: decryption does not care about key drift.
@@ -1224,6 +1252,7 @@ class UpdatekeysCommand(AgeKeyAction):
     verb = "updatekeys"
     would = WOULD_UPDATEKEYS
     done = UPDATEDKEYS
+    blocked = CANNOT_UPDATE
     nothing = "nothing to update"
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
@@ -1236,6 +1265,11 @@ class UpdatekeysCommand(AgeKeyAction):
             "--do-rotate", action="store_true",
             help="for those files also generate a new data key (implies the above)",
         )
+
+    def probe(self) -> str | None:
+        # `sops updatekeys` must unlock the data key first; a read-only decrypt
+        # tells us up front whether we even hold a key for it.
+        return "decrypt"
 
     def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
         if state is UPDATEKEYS:
@@ -1256,7 +1290,11 @@ class RotateCommand(AgeKeyAction):
     verb = "rotate"
     would = WOULD_ROTATE
     done = ROTATED
+    blocked = CANNOT_ROTATE
     nothing = "nothing to rotate"
+
+    def probe(self) -> str | None:
+        return "decrypt"
 
     def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
         # Plain sops semantics: rotate the data key, never touch the recipients.
