@@ -29,7 +29,7 @@ SHELL       := bash
 .PHONY: help playground demo status porcelain ls-rules ls-files match encrypt dry-run decrypt decrypt-dry-run decrypt-check updatekeys updatekeys-rotate rotate clean reset
 
 help:
-	@printf '%s\n' '' 'sops-tool playground' '' '  make playground    build ./$(PLAYGROUND)/ with sample rules and secrets' '  make demo          build it, then run every command against it' '  make status        sops-tool -C $(PLAYGROUND) status' '  make porcelain     sops-tool -C $(PLAYGROUND) status --porcelain' '  make decrypt-check status --decrypt-check: which keys open which file' '  make updatekeys    reconcile need-updatekeys files via sops updatekeys' '  make updatekeys-rotate  the same, also dropping keys the config dropped' '  make rotate        sync keys and generate a new data key (need rotate)' '  make ls-rules      list the sample creation rules' '  make ls-files      list files caught by the rules' '  make match         rule for FILE (default: $(FILE))' '  make encrypt       encrypt the not-yet-encrypted files in place' '  make decrypt       decrypt the encrypted files in place (uses keys/)' '  make dry-run       encrypt --dry-run: only print what would change' '  make decrypt-dry-run  decrypt --dry-run' '  make clean         remove ./$(PLAYGROUND)/' '  make reset         clean, then rebuild' ''
+	@printf '%s\n' '' 'sops-tool playground' '' '  make playground    build ./$(PLAYGROUND)/ with sample rules and secrets' '  make demo          build it, then run every command against it' '  make status        sops-tool -C $(PLAYGROUND) status' '  make porcelain     sops-tool -C $(PLAYGROUND) status --porcelain' '  make decrypt-check status --decrypt-check: which keys open which file' '  make updatekeys    reconcile need-updatekeys files via sops updatekeys' '  make updatekeys-rotate  --do-rotate: also re-key the need-rotate files' '  make rotate        sops semantics: new data key, recipients untouched' '  make ls-rules      list the sample creation rules' '  make ls-files      list files caught by the rules' '  make match         rule for FILE (default: $(FILE))' '  make encrypt       encrypt the not-yet-encrypted files in place' '  make decrypt       decrypt the encrypted files in place (uses keys/)' '  make dry-run       encrypt --dry-run: only print what would change' '  make decrypt-dry-run  decrypt --dry-run' '  make clean         remove ./$(PLAYGROUND)/' '  make reset         clean, then rebuild' ''
 
 $(STAMP): $(SOPS_TOOL) $(MAKEFILE_LIST)
 	@rm -rf $(PLAYGROUND)
@@ -195,7 +195,7 @@ updatekeys: $(STAMP)
 		$(foreach key,$(wildcard $(PLAYGROUND)/keys/age*.txt),--age-key-file $(CURDIR)/$(key)) || true
 
 updatekeys-rotate: $(STAMP)
-	@$(SOPS_TOOL) -C $(PLAYGROUND) updatekeys --rotate \
+	@$(SOPS_TOOL) -C $(PLAYGROUND) updatekeys --do-rotate \
 		$(foreach key,$(wildcard $(PLAYGROUND)/keys/age*.txt),--age-key-file $(CURDIR)/$(key)) || true
 
 rotate: $(STAMP)

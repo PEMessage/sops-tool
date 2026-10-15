@@ -43,7 +43,7 @@ Commands follow git's porcelain/plumbing split:
 | porcelain | `encrypt`  | encrypt matched files that are not encrypted yet    |
 | porcelain | `decrypt`  | decrypt matched files that are encrypted            |
 | porcelain | `updatekeys` | reconcile matched files' keys with `.sops.yaml`  |
-| porcelain | `rotate`   | sync a file's keys and generate a fresh data key    |
+| porcelain | `rotate`   | generate a new data key (recipients untouched)      |
 
 ## Usage
 
@@ -201,40 +201,56 @@ files are merged into one) is a convenience that `sops-tool` forwards to sops as
 The "smart" view — which of your keys can open which file — is
 `status --decrypt-check` (see above), not `decrypt`.
 
-`updatekeys` and `rotate` bring a file's master keys back in line with
-`.sops.yaml`. `updatekeys` targets the `need updatekeys` files (the rule wants a
-key the file lacks); pass `--rotate` to also apply it to the `need rotate` files
-(a file that carries a key the config no longer lists). It runs `sops updatekeys`,
-which reconciles in both directions:
+`updatekeys` and `rotate` touch a sops file's two-layer key structure: one
+symmetric *data key* per file, and a copy of it wrapped with each recipient's
+public key.
+
+`updatekeys` runs `sops updatekeys`, which reconciles the recipient list with
+`.sops.yaml` (re-wrapping the *same* data key). By default it handles the
+`need updatekeys` files — where the rule wants a key the file lacks:
 
 ```console
 $ sops-tool updatekeys -n
 would update     secrets/missing-key.yaml
+```
 
-$ sops-tool updatekeys --rotate -n
+Add `--include-need-rotate` to also cover the `need rotate` files (carrying a key
+the config no longer lists). Add `--do-rotate` to give those a fresh data key too
+(it implies `--include-need-rotate`): that is the real revocation, since the
+dropped key can no longer read what gets re-encrypted:
+
+```console
+$ sops-tool updatekeys --include-need-rotate -n
 would update     app/extra-key.yaml
 would update     secrets/missing-key.yaml
 
-$ sops-tool updatekeys --age-key-file keys/age.txt
+$ sops-tool updatekeys --do-rotate --age-key-file keys/age.txt
+updated keys     app/extra-key.yaml
 updated keys     secrets/missing-key.yaml
 ```
 
-`rotate` is the heavier fix for the `need rotate` files: a fresh data key, not
-just re-wrapped keys. Because `sops rotate` keeps the file's *existing* master
-keys, `sops-tool` rotates first (while the stale key can still unlock the data
-key) and then syncs the keys — so it works even when the key being dropped is the
-only one you hold:
+`sops rotate` keeps the file's existing master keys, so `--do-rotate` rotates the
+data key *first* (while the stale key can still unlock it) and then syncs the
+recipient list — it works even when the key being dropped is the only one you
+hold.
+
+`rotate` is the plain-sops counterpart: a new data key for every matched
+encrypted file, with the recipient list left completely alone. It therefore never
+changes a `status` state; use it to roll the data key, not to fix drift:
 
 ```console
 $ sops-tool rotate -n
 would rotate     app/extra-key.yaml
+would rotate     config/db.yaml
+...
 
 $ sops-tool rotate --age-key-file keys/age.txt
-rotated          app/extra-key.yaml
+rotated          secrets/prod.yaml
+...
 ```
 
-Both need an age identity to unlock the data key, supplied with the same
-`--age-key-file` (repeatable) and `SOPS_AGE_KEY*` machinery as `decrypt`, and both
+All three need an age identity to unlock the data key, supplied with the same
+`--age-key-file` (repeatable) and `SOPS_AGE_KEY*` machinery as `decrypt`, and all
 take the usual `--` path filter and `-n/--dry-run` / `-i/--interactive`.
 
 Plumbing is stable and script-friendly:

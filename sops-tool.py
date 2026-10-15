@@ -36,17 +36,17 @@ porcelain
   encrypt    encrypt matched, not-yet-encrypted files in place
   decrypt    decrypt matched files in place (a thin `sops` wrapper)
   updatekeys reconcile matched files' keys with .sops.yaml
-  rotate     sync a file's keys and generate a fresh data key
+  rotate     generate a new data key for matched encrypted files
 
 `status` reports every matched file, its keys and its encryption state. With
 `--decrypt-check` (`-d`) it also runs `sops --decrypt` on each encrypted file and
 marks the ones that open with an orange `*`, naming the matching keys where it
 can. `decrypt` does not share that view: it is a thin wrapper that simply runs
 `sops --decrypt` on the matched files and reports what sops says. `updatekeys`
-runs `sops updatekeys` on the files whose keys drifted from `.sops.yaml` — the
-`need updatekeys` ones by default, plus the `need rotate` ones with `--rotate`
-(sops updatekeys reconciles both directions). `rotate` is the heavier fix for the
-`need rotate` files: it syncs their keys and then rotates the data key.
+runs `sops updatekeys` on the `need updatekeys` files by default;
+`--include-need-rotate` also covers the `need rotate` ones, and `--do-rotate`
+additionally gives those a fresh data key. `rotate` is plain sops semantics: a
+new data key, with the recipient list left untouched.
 
 Commands accept `--` before paths, like git: `sops-tool status -- secrets/`.
 Paths are printed relative to the current directory by default; pass
@@ -66,11 +66,11 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Collection, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import yaml
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 CONFIG_NAME = ".sops.yaml"
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", ".venv", "node_modules"})
@@ -936,14 +936,15 @@ class FileCommand(Subcommand):
 class ActionCommand(FileCommand):
     """A command that inspects each matched file and may change it in place.
 
-    The `encrypt`/`decrypt`/`updatekeys` loop lives here once: inspect, classify
-    (against the rule's keys, so `need updatekeys` and `need rotate` are just
-    states), then skip, report, ask, or mutate. Subclasses only say which states
-    they act on and how.
+    The `encrypt`/`decrypt`/`updatekeys`/`rotate` loop lives here once: inspect,
+    classify (against the rule's keys, so `need updatekeys` and `need rotate` are
+    just states), then skip, report, ask, or change. A subclass only says *which
+    sops commands to run for a file in a given state* — that is `plan` — plus any
+    identity environment it needs.
 
     `probe_dry_run` says whether `--dry-run` should *ask sops* (read-only) — true
     for `decrypt`, where only sops can say whether a key is at hand — or merely
-    predict (false for `encrypt`/`updatekeys`, whose drift we already know).
+    predict (false elsewhere, where the drift is already known from metadata).
     """
 
     verb: str
@@ -963,31 +964,19 @@ class ActionCommand(FileCommand):
             help="confirm each file before changing it",
         )
 
-    def target_states(self, args: argparse.Namespace) -> Collection[State]:
-        """The states this command acts on, given its options."""
+    def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
+        """The sops actions to run for a file in *state* (empty sequence = skip)."""
         raise NotImplementedError
 
     def identity_environment(
         self, args: argparse.Namespace
     ) -> tuple[dict[str, str] | None, Path | None]:
-        """Extra environment (and a temp file to clean up) for the sops call."""
+        """Extra environment (and a temp file to clean up) for the sops calls."""
         return None, None
-
-    async def mutate(
-        self,
-        sops: Sops,
-        config: Config,
-        path: Path,
-        env: Mapping[str, str] | None,
-        in_place: bool,
-    ) -> str | None:
-        """Perform the change; return an error message, or None on success."""
-        raise NotImplementedError
 
     async def run(self, config: Config, args: argparse.Namespace) -> int:
         sops = Sops.require()
         env, temporary = self.identity_environment(args)
-        targets = self.target_states(args)
         reporter = Reporter()
         acted = errors = 0
         try:
@@ -999,8 +988,8 @@ class ActionCommand(FileCommand):
                     reporter.outcome(ERROR, display, inspection.error)
                     errors += 1
                     continue
-                state = _drift_state(inspection, frozenset(rule.keys()))
-                if state not in targets:
+                actions = self.plan(_drift_state(inspection, frozenset(rule.keys())), args)
+                if not actions:
                     continue
                 if args.dry_run and not self.probe_dry_run:
                     reporter.outcome(self.would, display)
@@ -1013,10 +1002,15 @@ class ActionCommand(FileCommand):
                     continue
 
                 # On a probing dry-run this is a read-only call; otherwise it
-                # really changes the file.
-                failure = await self.mutate(
-                    sops, config, path, env, in_place=not args.dry_run
-                )
+                # really changes the file. Run the actions in order, stop at the
+                # first failure.
+                failure: str | None = None
+                for action in actions:
+                    failure = await sops.change(
+                        config, action, path, env, in_place=not args.dry_run
+                    )
+                    if failure is not None:
+                        break
                 if failure is None:
                     reporter.outcome(self.would if args.dry_run else self.done, display)
                     acted += 1
@@ -1183,30 +1177,18 @@ class EncryptCommand(ActionCommand):
     would = WOULD_ENCRYPT
     done = ENCRYPTED
 
-    def target_states(self, args: argparse.Namespace) -> Collection[State]:
-        return {PLAIN}
-
-    async def mutate(
-        self,
-        sops: Sops,
-        config: Config,
-        path: Path,
-        env: Mapping[str, str] | None,
-        in_place: bool,
-    ) -> str | None:
-        return await sops.change(config, "encrypt", path)
+    def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
+        return ["encrypt"] if state is PLAIN else []
 
 
 class AgeKeyAction(ActionCommand):
     """An action whose sops command needs an age identity to unlock a data key.
 
-    `decrypt`, `updatekeys` and `rotate` all take `--age-key-file`, hand the
-    identity to sops through `SOPS_AGE_KEY_FILE`, and run one sops command. They
-    differ only in *which* command and *which* states they act on, so the shared
-    plumbing lives here.
+    `decrypt`, `updatekeys` and `rotate` all take `--age-key-file` and hand the
+    identity to sops through `SOPS_AGE_KEY_FILE`; only that plumbing lives here.
+    What each one *does* per state is its own `plan`.
     """
 
-    sops_action: str
     key_file_help = "age identity file (repeatable)"
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
@@ -1218,16 +1200,6 @@ class AgeKeyAction(ActionCommand):
     ) -> tuple[dict[str, str] | None, Path | None]:
         return _age_key_env(_resolve_key_files(args))
 
-    async def mutate(
-        self,
-        sops: Sops,
-        config: Config,
-        path: Path,
-        env: Mapping[str, str] | None,
-        in_place: bool,
-    ) -> str | None:
-        return await sops.change(config, self.sops_action, path, env, in_place=in_place)
-
 
 @subcommand
 class DecryptCommand(AgeKeyAction):
@@ -1238,11 +1210,10 @@ class DecryptCommand(AgeKeyAction):
     would = WOULD_DECRYPT
     done = DECRYPTED
     probe_dry_run = True  # only sops can say whether a key is at hand
-    sops_action = "decrypt"
 
-    def target_states(self, args: argparse.Namespace) -> Collection[State]:
+    def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
         # Any encrypted file: decryption does not care about key drift.
-        return set(ENCRYPTED_STATES)
+        return ["decrypt"] if state in ENCRYPTED_STATES else []
 
 
 @subcommand
@@ -1254,53 +1225,42 @@ class UpdatekeysCommand(AgeKeyAction):
     would = WOULD_UPDATEKEYS
     done = UPDATEDKEYS
     nothing = "nothing to update"
-    sops_action = "updatekeys"
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
         super().configure(parser)
         parser.add_argument(
-            "--rotate", action="store_true",
+            "--include-need-rotate", action="store_true",
             help="also update files that carry a key .sops.yaml no longer lists",
         )
+        parser.add_argument(
+            "--do-rotate", action="store_true",
+            help="for those files also generate a new data key (implies the above)",
+        )
 
-    def target_states(self, args: argparse.Namespace) -> Collection[State]:
-        states = {UPDATEKEYS}
-        if args.rotate:
-            states.add(ROTATE)  # `sops updatekeys` drops the stale keys too
-        return states
+    def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
+        if state is UPDATEKEYS:
+            return ["updatekeys"]
+        if state is ROTATE and (args.do_rotate or args.include_need_rotate):
+            # `sops rotate` keeps the file's *existing* master keys, so it cannot
+            # by itself drop the stale one. Rotate first (while that key still
+            # unlocks the data key), then let updatekeys sync the recipient list.
+            return ["rotate", "updatekeys"] if args.do_rotate else ["updatekeys"]
+        return []
 
 
 @subcommand
 class RotateCommand(AgeKeyAction):
     name = "rotate"
-    help = "re-key matched files: sync their keys and generate a new data key"
+    help = "generate a new data key for matched encrypted files (recipients untouched)"
 
     verb = "rotate"
     would = WOULD_ROTATE
     done = ROTATED
     nothing = "nothing to rotate"
-    sops_action = "rotate"
 
-    def target_states(self, args: argparse.Namespace) -> Collection[State]:
-        return {ROTATE}
-
-    async def mutate(
-        self,
-        sops: Sops,
-        config: Config,
-        path: Path,
-        env: Mapping[str, str] | None,
-        in_place: bool,
-    ) -> str | None:
-        # `sops rotate` re-encrypts with the file's *existing* master keys, so on
-        # its own it would leave the `need rotate` drift in place. Rotating first
-        # (while the old key can still unlock the data key), then syncing keys,
-        # both re-keys and drops the stale ones — even when the stale key is the
-        # only one we hold.
-        failure = await sops.change(config, "rotate", path, env, in_place=in_place)
-        if failure is not None:
-            return failure
-        return await sops.change(config, "updatekeys", path, env)
+    def plan(self, state: State, args: argparse.Namespace) -> Sequence[str]:
+        # Plain sops semantics: rotate the data key, never touch the recipients.
+        return ["rotate"] if state in ENCRYPTED_STATES else []
 
 
 # --------------------------------------------------------------------------- #
